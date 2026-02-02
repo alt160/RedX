@@ -1,0 +1,209 @@
+[[RedX]] Primer
+
+  [[Overview]]
+    [[RedX]] is a symmetric cipher construction based
+    on deterministic [[Traversal]] over a two-
+    dimensional permutation grid. [[Cipherbytes]]
+    encode relative traversal distances rather than
+    transformed plaintext values.
+
+  [[Core Concepts]]
+
+    [[Plainbytes]]
+      [[Plainbytes]] are byte values consumed during
+      [[Traversal]]. They include user input bytes
+      and injected bytes such as [[PrefixBytes]] and
+      [[StartLocation]] encodings. All [[Plainbytes]]
+      are processed uniformly.
+
+    [[Cipherbytes]]
+      [[Cipherbytes]] encode distances between
+      successive traversal landing positions within
+      a single 256-byte key row. They do not represent
+      transformed plaintext values.
+
+    [[Traversal]]
+      [[Traversal]] is the deterministic process of
+      advancing through the [[RedXKey]] grid using
+      jump values, landing positions, and offset
+      emission.
+
+    [[JumpStream]]
+      The [[JumpStream]] is a deterministic sequence
+      of jump values derived from [[KeyBaseData]] and
+      per-execution inputs. Jump values are
+      independent of [[Plainbytes]].
+
+    [[LandingSemantics]]
+      Each jump produces a landing position within
+      the current key row. A [[Cipherbyte]] is emitted
+      as the forward wrapped distance to the target
+      column selected by the current [[Plainbyte]].
+
+    [[RowAdvancement]]
+      After each landing and emission, traversal
+      advances to the next key row deterministically,
+      modulo the total row count.
+
+  [[Start Location And Prefixes]]
+
+    [[StartLocation]]
+      The [[StartLocation]] is a per-execution value
+      that establishes the initial traversal origin.
+      Its encoded bytes are consumed as [[Plainbytes]]
+      across multiple traversal steps.
+
+    [[PrefixBytes]]
+      [[PrefixBytes]] are a per-execution sequence of
+      injected [[Plainbytes]] consumed before user
+      input. They are indistinguishable from user
+      input during traversal.
+
+  [[Input And Plainbytes]]
+
+    [[Input]]
+      [[Input]] to [[RedX]] is an ordered sequence of
+      bytes. Any byte that participates in traversal
+      is a [[Plainbyte]].
+
+    [[PlainbyteSources]]
+      [[Plainbytes]] include user input bytes,
+      [[PrefixBytes]], [[StartLocation]] bytes, and
+      other injected per-execution values. Source
+      does not affect traversal behavior.
+
+  [[Integrity]]
+
+    [[IntegritySeal]]
+      The [[IntegritySeal]] is an optional per-
+      execution mechanism that binds ciphertext
+      validity to traversal replay. The seal is
+      mapped under the same traversal machinery.
+
+    [[FailClosedBehavior]]
+      If [[IntegritySeal]] validation fails during
+      decryption, traversal replay halts and no
+      plaintext output is produced.
+
+  [[Keys]]
+
+    [[RedXKey]]
+
+      [[WhatItIs]]
+
+        [[SerializedForm]]
+          A [[RedXKey]] is represented as a two-
+          dimensional grid of bytes. Each row is
+          exactly 256 bytes wide and is a permutation
+          of values 0–255.
+
+        [[ExecutionForm]]
+          In execution form, a [[RedXKey]] exists as
+          traversal-defining state. It deterministically
+          defines jump generation, landing behavior,
+          and offset emission.
+
+      [[WhatItIsNot]]
+
+        [[SerializedForm]]
+          A [[RedXKey]] is not a number, scalar, or
+          algebraic structure. It does not encode
+          block structure or plaintext-dependent
+          state.
+
+        [[ExecutionForm]]
+          A [[RedXKey]] is not a reversible transform,
+          block cipher state, or stream cipher seed.
+
+    [[MintingKey]]
+
+      [[WhatItIs]]
+
+        [[SerializedForm]]
+          A [[MintingKey]] is a composite key artifact
+          containing complete [[RedXKey]] base data
+          and minting authority material.
+
+        [[ExecutionForm]]
+          In execution form, a [[MintingKey]] exists
+          as traversal-defining state plus attestation-
+          generating capability.
+
+      [[WhatItIsNot]]
+
+        [[SerializedForm]]
+          A [[MintingKey]] is not a public key,
+          [[VerifierKey]], or standalone signing key.
+
+        [[ExecutionForm]]
+          A [[MintingKey]] is not intended to
+          decrypt and verify ciphertext it produces;
+          verification is a verifier role, not a
+          cryptographic lock.
+
+    [[VerifierKey]]
+
+      [[WhatItIs]]
+
+        [[SerializedForm]]
+          A [[VerifierKey]] is a composite, secret key
+          artifact containing [[RedXKey]] base data
+          and verification-only authority material.
+
+        [[ExecutionForm]]
+          In execution form, a [[VerifierKey]] exists
+          as derived traversal state plus attestation-
+          verification capability.
+
+      [[WhatItIsNot]]
+
+        [[SerializedForm]]
+          A [[VerifierKey]] is not a [[MintingKey]] and
+          does not contain minting authority material.
+
+        [[ExecutionForm]]
+          A [[VerifierKey]] cannot generate mint-bound
+          attestations or mint acceptable ciphertext.
+
+  [[MintVerifyMode]]
+
+    [[Overview]]
+      [[MintVerifyMode]] separates the capability to
+      mint acceptable ciphertext from the capability
+      to decrypt and validate ciphertext.
+
+    [[RelationshipToSymmetricOperation]]
+      [[MintVerifyMode]] builds directly on symmetric
+      [[Traversal]] without altering cipher semantics
+      or integrity behavior.
+
+    [[IntendedProblemSpace]]
+      [[MintVerifyMode]] applies where creation
+      authority and consumption capability must be
+      separated, such as controlled distribution or
+      delegated decryption.
+
+    [[WhatItIsNot]]
+      [[MintVerifyMode]] does not define a new
+      asymmetric primitive and relies on an existing
+      asymmetric signing primitive with non-
+      reversible verification roles.
+
+  [[ClaimsAndNonClaims]]
+
+    [[Claims]]
+      This document defines [[RedX]] mechanics,
+      invariants, and nomenclature. All claims are
+      intended to be falsifiable through analysis or
+      implementation.
+
+    [[NonClaims]]
+      This document does not present a formal security
+      proof, claim post-quantum resistance, or claim
+      suitability for production deployment.
+
+    [[ImplementationPosture]]
+      The provided implementation exists for
+      analysis, critique, experimentation, and proof
+      work as a reference realization of described
+      mechanics.

@@ -1,0 +1,13 @@
+﻿// See https://aka.ms/new-console-template for more information
+Console.WriteLine("Hello, World!");
+
+
+var k1 = RobinsonEncryptionLib.RE.CreateKey();
+
+var test = System.Text.Encoding.UTF8.GetBytes("This is secret stuff!");
+
+var e1 = k1.DrawPath(test.AsSpan());
+Console.WriteLine(BitConverter.ToString(e1.skips.ToArray()));
+var e2 = k1.FollowPath(e1.skips, e1.kStar);
+Console.WriteLine(System.Text.Encoding.UTF8.GetString(e2));
+Console.WriteLine(e2.Length);
