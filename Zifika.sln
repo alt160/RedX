@@ -9,7 +9,10 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 	ProjectSection(SolutionItems) = preProject
 		.gitignore = .gitignore
 		AGENTS.md = AGENTS.md
+		CONTRIBUTING.md = CONTRIBUTING.md
+		LICENSE.md = LICENSE.md
 		README.md = README.md
+		TRADEMARKS.md = TRADEMARKS.md
 	EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ZifikaLib", "ZifikaLib\ZifikaLib.csproj", "{9A94397A-62F5-1B5D-BC89-6C4EE7C40E2D}"

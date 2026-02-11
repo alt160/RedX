@@ -13,7 +13,7 @@
 
   <ItemGroup>
     <None Remove="Cleanup tasks.md" />
-    <None Remove="[[RedX]] Primer.txt" />
+    <None Remove="[[Zifika]] Primer.txt" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,15 +1,15 @@
-# Contributing to RedX
+# Contributing to Zifika
 
-Thank you for your interest in contributing to **RedX**.
+Thank you for your interest in contributing to **Zifika**.
 
-RedX is an *experimental cryptographic construction* published to invite review, critique, and improvement. Contributions are welcome, but the bar is intentionally high: correctness, clarity of intent, and fidelity to the documented design matter more than feature velocity.
+Zifika is an *experimental cryptographic construction* published to invite review, critique, and improvement. Contributions are welcome, but the bar is intentionally high: correctness, clarity of intent, and fidelity to the documented design matter more than feature velocity.
 
 
 ---
 
 ## Scope of Contributions
 
-RedX accepts contributions in the following categories:
+Zifika accepts contributions in the following categories:
 
 ### 1. Cryptographic Review & Analysis (Highly Valued)
 - Design critique
@@ -68,7 +68,7 @@ Documentation should remain technically precise. Marketing language will be reje
 
 The following will generally not be accepted:
 
-- Replacing RedX with a standard cipher (AES, ChaCha, etc.)
+- Replacing Zifika with a standard cipher (AES, ChaCha, etc.)
 - Claims of security proofs
 - "Drop-in replacement" positioning
 - Large API surface expansion without prior discussion
@@ -92,7 +92,7 @@ If a contribution challenges one of these, open an issue *before* writing code.
 
 ## Cryptographic Honesty Policy
 
-RedX is published with explicit non-claims:
+Zifika is published with explicit non-claims:
 - No formal proof
 - No standardization claim
 - No post-quantum claim
@@ -158,15 +158,15 @@ By submitting a contribution, you agree that:
 
 ## Trademark Notice
 
-Use of the name **RedX** is governed by `TRADEMARKS.md`.
+Use of the name **Zifika** is governed by `TRADEMARKS.md`.
 
-Forks and derivatives must clearly distinguish themselves and must not present as "official RedX".
+Forks and derivatives must clearly distinguish themselves and must not present as "official Zifika".
 
 ---
 
 ## Final Note
 
-RedX is intentionally unconventional. If your instinct is to make it look like existing crypto, you may be solving the wrong problem.
+Zifika is intentionally unconventional. If your instinct is to make it look like existing crypto, you may be solving the wrong problem.
 
 Thoughtful disagreement is welcome. Superficial conformity is not.
 

@@ -5,16 +5,16 @@ for names, marks, and identifiers associated with this project.
 
 ---
 
-## RedX
+## Zifika
 
-“RedX” is the name of a cryptographic software project and related
+“Zifika” is the name of a cryptographic software project and related
 algorithmic construction.
 
-The name **RedX** may be used to refer to:
+The name **Zifika** may be used to refer to:
 
-- The RedX cipher and its documented behavior
+- The Zifika cipher and its documented behavior
 - The reference implementation published in this repository
-- Academic, technical, or security analysis of the RedX design
+- Academic, technical, or security analysis of the Zifika design
 
 No trademark rights are granted by the Apache License.
 
@@ -25,10 +25,10 @@ No trademark rights are granted by the Apache License.
 Unless otherwise stated, all trademarks, service marks, and logos
 associated with this project are owned by the project author(s).
 
-The project author reserves the right to register the RedX name
+The project author reserves the right to register the Zifika name
 or related marks in the future.
 
-Use of the name “RedX” does not imply endorsement, certification,
+Use of the name “Zifika” does not imply endorsement, certification,
 or affiliation unless explicitly stated in writing.
 
 ---
@@ -38,16 +38,16 @@ or affiliation unless explicitly stated in writing.
 The following uses are permitted without prior written permission:
 
 - Referential use in documentation, research, blogs, or papers
-- Discussion, critique, or analysis of the RedX design or implementation
-- Identification of compatibility with the RedX reference implementation
+- Discussion, critique, or analysis of the Zifika design or implementation
+- Identification of compatibility with the Zifika reference implementation
 - Forks or derivatives that clearly distinguish themselves from
   the original project
 
 Examples of permitted use:
 
-- “This paper analyzes the RedX cipher.”
-- “Compatible with RedX (reference implementation).”
-- “Derived from the RedX algorithm (modified).”
+- “This paper analyzes the Zifika cipher.”
+- “Compatible with Zifika (reference implementation).”
+- “Derived from the Zifika algorithm (modified).”
 
 ---
 
@@ -55,17 +55,17 @@ Examples of permitted use:
 
 The following uses are **not permitted** without prior written consent:
 
-- Presenting modified or forked versions as “official RedX”
-- Using “RedX” in a way that implies certification, approval,
+- Presenting modified or forked versions as “official Zifika”
+- Using “Zifika” in a way that implies certification, approval,
   or security endorsement by the original author
-- Using the RedX name or logo as part of a commercial product name
+- Using the Zifika name or logo as part of a commercial product name
   without clear differentiation
 
 Examples of restricted use:
 
-- “RedX Secure™ Enterprise Edition”
-- “Official RedX Certified Encryption”
-- “RedX-approved cryptographic system”
+- “Zifika Secure™ Enterprise Edition”
+- “Official Zifika Certified Encryption”
+- “Zifika-approved cryptographic system”
 
 ---
 
@@ -81,10 +81,10 @@ If logos, icons, or visual identifiers are introduced:
 
 ## No Warranty or Endorsement
 
-Use of the RedX name does not constitute a warranty, security guarantee,
+Use of the Zifika name does not constitute a warranty, security guarantee,
 or fitness for purpose.
 
-The RedX project is experimental and published for analysis.
+The Zifika project is experimental and published for analysis.
 
 ---
 
