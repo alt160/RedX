@@ -2,6 +2,8 @@ using ZifikaLib;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using TextCopy;
@@ -1589,6 +1591,25 @@ byte[] MutateAppend(ReadOnlySpan<byte> src, ReadOnlySpan<byte> tail)
 }
 
 /// <summary>
+/// Extract the mint/verify payload row-offset segment from a full wire buffer by tail slicing.<br/>
+/// Assumes payload stream length equals plaintext length and (when enabled) a 32-byte integrity seal is the final segment.<br/>
+/// Returns empty when the requested segment cannot be represented safely by the provided inputs.<br/>
+/// </summary>
+/// <param name="wire">Full mint/verify wire bytes.<br/></param>
+/// <param name="plainLen">Expected plaintext length for the sample.<br/></param>
+/// <param name="hasIntegritySeal">Whether a 32-byte seal is present at wire tail.<br/></param>
+/// <returns>Payload row-offset bytes for stats probes.<br/></returns>
+byte[] ExtractMintVerifyPayloadSegment(ReadOnlySpan<byte> wire, int plainLen, bool hasIntegritySeal)
+{
+    if (plainLen <= 0) return Array.Empty<byte>();
+    int sealLen = hasIntegritySeal ? 32 : 0;
+    if (wire.Length < plainLen + sealLen) return Array.Empty<byte>();
+    int start = wire.Length - sealLen - plainLen;
+    if (start < 0) return Array.Empty<byte>();
+    return wire.Slice(start, plainLen).ToArray();
+}
+
+/// <summary>
 /// Splice two ciphertexts by taking first half from A and second half from B.<br/>
 /// This simulates cross-message grafting attacks that break transcript continuity.<br/>
 /// </summary>
@@ -1688,6 +1709,871 @@ void PrintAttackLine(string mode, string payloadLabel, string attackName, bool b
         $"[{mode}-attack][{payloadLabel}] {attackName}: blocked-or-garbled={blockedOrGarbled} ({outcome})");
     if (detail)
         WriteLineColor(ConsoleColor.Red, $"[{mode}-attack][{payloadLabel}] tampered: {HexWithLen(tampered, 32)}");
+}
+
+/// <summary>
+/// Count set bits in one byte using Kernighan reduction.<br/>
+/// Kept local to avoid extra dependencies while staying deterministic.<br/>
+/// </summary>
+/// <param name="value">Input byte to count.<br/></param>
+/// <returns>Number of set bits (0..8).<br/></returns>
+int CountBits(byte value)
+{
+    int count = 0;
+    while (value != 0)
+    {
+        value = (byte)(value & (value - 1));
+        count++;
+    }
+    return count;
+}
+
+/// <summary>
+/// Compute Shannon entropy, chi-square, serial correlation, and bit-balance for one wire byte span.<br/>
+/// Metrics are sample-local and intended for comparative analysis, not proof-level claims.<br/>
+/// </summary>
+/// <param name="data">Full wire bytes for one sample.<br/></param>
+/// <returns>Tuple of entropy, chi-square, serial correlation, and ones-ratio.<br/></returns>
+(double Entropy, double ChiSquare, double SerialCorrelation, double BitBalance) ComputeWireMetrics(ReadOnlySpan<byte> data)
+{
+    if (data.IsEmpty) return (0d, 0d, 0d, 0d);
+
+    int[] freq = new int[256];
+    double ones = 0;
+    double sumX = 0;
+    double sumY = 0;
+    double sumXX = 0;
+    double sumYY = 0;
+    double sumXY = 0;
+    int pairCount = 0;
+
+    byte prev = 0;
+    bool hasPrev = false;
+    for (int i = 0; i < data.Length; i++)
+    {
+        byte b = data[i];
+        freq[b]++;
+        ones += CountBits(b);
+
+        if (hasPrev)
+        {
+            sumX += prev;
+            sumY += b;
+            sumXX += prev * prev;
+            sumYY += b * b;
+            sumXY += prev * b;
+            pairCount++;
+        }
+        prev = b;
+        hasPrev = true;
+    }
+
+    double total = data.Length;
+    double entropy = 0d;
+    double expected = total / 256d;
+    double chi = 0d;
+    for (int i = 0; i < 256; i++)
+    {
+        if (freq[i] > 0)
+        {
+            double p = freq[i] / total;
+            entropy -= p * (Math.Log(p) / Math.Log(2));
+        }
+        double diff = freq[i] - expected;
+        chi += (diff * diff) / expected;
+    }
+
+    double serial = 0d;
+    if (pairCount > 1)
+    {
+        double n = pairCount;
+        double num = n * sumXY - (sumX * sumY);
+        double denLeft = n * sumXX - (sumX * sumX);
+        double denRight = n * sumYY - (sumY * sumY);
+        double den = Math.Sqrt(Math.Max(0d, denLeft * denRight));
+        serial = den > 0 ? num / den : 0d;
+    }
+
+    double bitBalance = ones / (8d * total);
+    return (entropy, chi, serial, bitBalance);
+}
+
+/// <summary>
+/// Summarize a sequence of scalar values with mean/stddev/min/max.<br/>
+/// Stddev is sample standard deviation (n-1 denominator) when n&gt;1.<br/>
+/// </summary>
+/// <param name="values">Sequence to summarize.<br/></param>
+/// <returns>Tuple of mean, stddev, min, and max.<br/></returns>
+(double Mean, double StdDev, double Min, double Max) Summarize(IReadOnlyList<double> values)
+{
+    if (values == null || values.Count == 0) return (0d, 0d, 0d, 0d);
+    double sum = 0d;
+    double sumSq = 0d;
+    double min = double.PositiveInfinity;
+    double max = double.NegativeInfinity;
+    for (int i = 0; i < values.Count; i++)
+    {
+        double v = values[i];
+        sum += v;
+        sumSq += v * v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+    double n = values.Count;
+    double mean = sum / n;
+    double variance = n > 1 ? Math.Max(0d, (sumSq - ((sum * sum) / n)) / (n - 1d)) : 0d;
+    return (mean, Math.Sqrt(variance), min, max);
+}
+
+/// <summary>
+/// Compute an inclusive linear-interpolated percentile from a scalar sample list.<br/>
+/// p must be in [0,1]. Returns 0 for empty inputs.<br/>
+/// </summary>
+double Percentile(IReadOnlyList<double> values, double p)
+{
+    if (values == null || values.Count == 0) return 0d;
+    if (p <= 0d)
+    {
+        double min = double.PositiveInfinity;
+        for (int i = 0; i < values.Count; i++) if (values[i] < min) min = values[i];
+        return min;
+    }
+    if (p >= 1d)
+    {
+        double max = double.NegativeInfinity;
+        for (int i = 0; i < values.Count; i++) if (values[i] > max) max = values[i];
+        return max;
+    }
+
+    var sorted = new double[values.Count];
+    for (int i = 0; i < values.Count; i++) sorted[i] = values[i];
+    Array.Sort(sorted);
+
+    double rank = p * (sorted.Length - 1);
+    int lo = (int)Math.Floor(rank);
+    int hi = (int)Math.Ceiling(rank);
+    if (lo == hi) return sorted[lo];
+    double t = rank - lo;
+    return sorted[lo] + ((sorted[hi] - sorted[lo]) * t);
+}
+
+/// <summary>
+/// Compute Welch's t-statistic between two independent timing groups.<br/>
+/// Returns 0 when groups are too small or variance is degenerate.<br/>
+/// </summary>
+/// <param name="groupA">Group A values.<br/></param>
+/// <param name="groupB">Group B values.<br/></param>
+/// <returns>Welch t-statistic.<br/></returns>
+double ComputeWelchT(IReadOnlyList<double> groupA, IReadOnlyList<double> groupB)
+{
+    if (groupA == null || groupB == null || groupA.Count < 2 || groupB.Count < 2) return 0d;
+    var sA = Summarize(groupA);
+    var sB = Summarize(groupB);
+    double nA = groupA.Count;
+    double nB = groupB.Count;
+    double varA = sA.StdDev * sA.StdDev;
+    double varB = sB.StdDev * sB.StdDev;
+    double den = Math.Sqrt((varA / nA) + (varB / nB));
+    if (den <= 0d) return 0d;
+    return (sA.Mean - sB.Mean) / den;
+}
+
+/// <summary>
+/// Compute normalized Hamming distance between two byte spans with zero-padding on the shorter side.<br/>
+/// This allows comparing full-wire outputs even when lengths diverge.<br/>
+/// </summary>
+/// <param name="a">First byte span.<br/></param>
+/// <param name="b">Second byte span.<br/></param>
+/// <returns>Bit-difference ratio in [0,1].<br/></returns>
+double ComputeNormalizedBitDistance(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+{
+    int maxLen = Math.Max(a.Length, b.Length);
+    if (maxLen == 0) return 0d;
+    int bitDiff = 0;
+    for (int i = 0; i < maxLen; i++)
+    {
+        byte av = i < a.Length ? a[i] : (byte)0;
+        byte bv = i < b.Length ? b[i] : (byte)0;
+        bitDiff += CountBits((byte)(av ^ bv));
+    }
+    return bitDiff / (8d * maxLen);
+}
+
+/// <summary>
+/// Build 16 deterministic bytes from an integer seed for key derivation convenience.<br/>
+/// This seed only controls harness-generated randomness; core library RNG use remains internal.<br/>
+/// </summary>
+/// <param name="seed">Deterministic seed value.<br/></param>
+/// <returns>16-byte seed buffer.<br/></returns>
+byte[] BuildDeterministicSeedBytes(int seed)
+{
+    var rng = new Random(seed);
+    var bytes = new byte[16];
+    rng.NextBytes(bytes);
+    return bytes;
+}
+
+/// <summary>
+/// Create a deterministic analysis payload for one sample index with mixed structure and entropy patterns.<br/>
+/// This keeps sample generation reproducible while covering both regular and irregular byte distributions.<br/>
+/// </summary>
+/// <param name="rng">Deterministic RNG for payload generation.<br/></param>
+/// <param name="index">Sample index.<br/></param>
+/// <returns>Payload bytes for analysis sample.<br/></returns>
+byte[] BuildAnalysisPayload(Random rng, int index)
+{
+    int bucket = index % 6;
+    if (bucket == 0) return BuildPatternPayload(1 + (index % 64), "analysis-text-");
+    if (bucket == 1) return BuildPatternPayload(64 + (index % 193), "review-coverage-");
+    if (bucket == 2) return BuildFilledPayload(96, 0x00);
+    if (bucket == 3) return BuildFilledPayload(96, 0xFF);
+    if (bucket == 4) return BuildPatternPayloadBytes(257, new byte[] { 0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF, 0x1B, 0x20 });
+    int len = rng.Next(1, 1025);
+    var data = new byte[len];
+    rng.NextBytes(data);
+    return data;
+}
+
+/// <summary>
+/// Parse an optional positive integer from console input, using default when blank/EOF.<br/>
+/// Retries on invalid input until a valid value or blank is entered.<br/>
+/// </summary>
+/// <param name="prompt">Prompt shown to the user.<br/></param>
+/// <param name="defaultValue">Default when blank/EOF.<br/></param>
+/// <param name="min">Minimum accepted value (inclusive).<br/></param>
+/// <param name="max">Maximum accepted value (inclusive).<br/></param>
+/// <returns>Parsed value or default.<br/></returns>
+int ReadOptionalPositiveInt(string prompt, int defaultValue, int min = 1, int max = int.MaxValue)
+{
+    while (true)
+    {
+        Console.Write(prompt);
+        var raw = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(raw)) return defaultValue;
+        if (int.TryParse(raw.Trim(), out int value) && value >= min && value <= max)
+            return value;
+        WriteLineColor(ConsoleColor.Red, $"Enter an integer in [{min},{max}] or blank for default ({defaultValue}).");
+    }
+}
+
+/// <summary>
+/// Parse an optional 32-bit integer seed from console input, using default when blank/EOF.<br/>
+/// Retries on invalid input until a valid value or blank is entered.<br/>
+/// </summary>
+/// <param name="prompt">Prompt shown to the user.<br/></param>
+/// <param name="defaultValue">Default when blank/EOF.<br/></param>
+/// <returns>Parsed seed or default.<br/></returns>
+int ReadOptionalSeedInt(string prompt, int defaultValue)
+{
+    while (true)
+    {
+        Console.Write(prompt);
+        var raw = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(raw)) return defaultValue;
+        if (int.TryParse(raw.Trim(), out int value))
+            return value;
+        WriteLineColor(ConsoleColor.Red, $"Enter a valid Int32 seed or blank for default ({defaultValue}).");
+    }
+}
+
+/// <summary>
+/// Resolve artifact output directory for CSV export, preferring TestHarness/artifacts from repo root.<br/>
+/// Falls back to local artifacts/ when running from project-local working directories.<br/>
+/// </summary>
+/// <returns>Directory path that exists after return.<br/></returns>
+string ResolveArtifactsDirectory()
+{
+    string dir = Directory.Exists("TestHarness") ? Path.Combine("TestHarness", "artifacts") : "artifacts";
+    Directory.CreateDirectory(dir);
+    return dir;
+}
+
+/// <summary>
+/// Format numeric values using invariant culture for stable CSV output across locales.<br/>
+/// </summary>
+/// <param name="value">Number to format.<br/></param>
+/// <returns>Invariant fixed-point string.<br/></returns>
+string Fmt(double value) => value.ToString("F6", CultureInfo.InvariantCulture);
+
+/// <summary>
+/// Execute per-mode analysis with hard checks on full wire and metric probes over a selectable byte projection.<br/>
+/// Caller supplies mode-specific delegates for encryption/decryption/tamper behavior.<br/>
+/// </summary>
+/// <param name="modeName">Mode label for output rows.<br/></param>
+/// <param name="sampleCount">Number of samples to generate/analyze.<br/></param>
+/// <param name="seed">Deterministic seed controlling harness-side payload/mutation generation.<br/></param>
+/// <param name="encryptWire">Encrypt/mint delegate returning full wire bytes.<br/></param>
+/// <param name="roundtripMatches">Roundtrip verification delegate.<br/></param>
+/// <param name="tamperBlockedOrGarbled">Tamper evaluation delegate returning blocked/garbled and outcome text.<br/></param>
+/// <param name="wrongKeyBlockedOrGarbled">Wrong-key/verifier acceptance delegate.<br/></param>
+/// <param name="seedLabel">Optional label used to keep deterministic sample generation aligned across related modes.<br/></param>
+/// <param name="metricBytesSelector">Optional projection that selects which bytes are scored by statistical probes; defaults to full wire.<br/></param>
+/// <param name="sampleRows">CSV row sink for per-sample records.<br/></param>
+/// <returns>Mode analysis summary.<br/></returns>
+AnalysisModeResult RunModeAnalysisCore(
+    string modeName,
+    int sampleCount,
+    int seed,
+    Func<byte[], byte[]> encryptWire,
+    Func<byte[], byte[], bool> roundtripMatches,
+    Func<byte[], byte[], (bool blockedOrGarbled, string outcome)> tamperBlockedOrGarbled,
+    Func<byte[], byte[], bool> wrongKeyBlockedOrGarbled,
+    string seedLabel,
+    Func<byte[], byte[], byte[]> metricBytesSelector,
+    List<string> sampleRows)
+{
+    static void WriteProgress(string mode, int done, int total)
+    {
+        if (total <= 0) return;
+        const int width = 30;
+        double ratio = Math.Clamp(done / (double)total, 0d, 1d);
+        int fill = (int)Math.Round(width * ratio);
+        if (fill < 0) fill = 0;
+        if (fill > width) fill = width;
+        string bar = new string('#', fill) + new string('-', width - fill);
+        Console.Write($"\r[analysis][{mode}] [{bar}] {done}/{total}");
+        if (done >= total) Console.WriteLine();
+    }
+    static void WritePhase(string mode, string phase)
+    {
+        Console.WriteLine($"[analysis][{mode}] phase: {phase}");
+    }
+
+    string effectiveSeedLabel = string.IsNullOrWhiteSpace(seedLabel) ? modeName : seedLabel;
+    var rng = new Random(seed ^ StableSeedFromLabel("analysis-" + effectiveSeedLabel));
+    var freq = new long[256];
+    long totalBytes = 0;
+    long onesTotal = 0;
+    double pairSumX = 0d;
+    double pairSumY = 0d;
+    double pairSumXX = 0d;
+    double pairSumYY = 0d;
+    double pairSumXY = 0d;
+    long pairCount = 0;
+    var wireLengths = new List<double>(sampleCount);
+    var avalancheSamples = new List<double>(Math.Min(sampleCount, 2000));
+
+    int roundtripTotal = 0;
+    int roundtripPassed = 0;
+    int tamperTotal = 0;
+    int tamperPassed = 0;
+    int wrongKeyTotal = 0;
+    int wrongKeyPassed = 0;
+    byte[] firstPlain = null;
+    byte[] firstWire = null;
+    int progressTick = Math.Max(1, sampleCount / 100);
+
+    WriteProgress(modeName, 0, sampleCount);
+
+    for (int i = 0; i < sampleCount; i++)
+    {
+        var plain = BuildAnalysisPayload(rng, i);
+        var wire = encryptWire(plain);
+        if (firstWire == null)
+        {
+            firstPlain = plain;
+            firstWire = wire;
+        }
+
+        var metricBytes = metricBytesSelector != null ? metricBytesSelector(wire, plain) : wire;
+        metricBytes ??= Array.Empty<byte>();
+        var wm = ComputeWireMetrics(metricBytes);
+        wireLengths.Add(metricBytes.Length);
+
+        for (int b = 0; b < metricBytes.Length; b++)
+        {
+            byte val = metricBytes[b];
+            freq[val]++;
+            totalBytes++;
+            onesTotal += CountBits(val);
+
+            if (b > 0)
+            {
+                byte prev = metricBytes[b - 1];
+                pairSumX += prev;
+                pairSumY += val;
+                pairSumXX += prev * prev;
+                pairSumYY += val * val;
+                pairSumXY += prev * val;
+                pairCount++;
+            }
+        }
+
+        bool roundtripOk = roundtripMatches(wire, plain);
+        roundtripTotal++;
+        if (roundtripOk) roundtripPassed++;
+
+        int tamperIndex = wire.Length == 0 ? 0 : ((i * 131) % wire.Length);
+        var tampered = MutateFlipByte(wire, tamperIndex, (byte)(1 << (i % 8)));
+        var tamperEval = tamperBlockedOrGarbled(tampered, plain);
+        bool tamperOk = tamperEval.blockedOrGarbled;
+        tamperTotal++;
+        if (tamperOk) tamperPassed++;
+
+        sampleRows.Add(string.Join(",",
+            modeName,
+            i.ToString(CultureInfo.InvariantCulture),
+            plain.Length.ToString(CultureInfo.InvariantCulture),
+            wire.Length.ToString(CultureInfo.InvariantCulture),
+            metricBytes.Length.ToString(CultureInfo.InvariantCulture),
+            Fmt(wm.Entropy),
+            Fmt(wm.ChiSquare),
+            Fmt(wm.SerialCorrelation),
+            tamperIndex.ToString(CultureInfo.InvariantCulture),
+            tamperEval.outcome ?? string.Empty,
+            roundtripOk ? "1" : "0",
+            tamperOk ? "1" : "0"));
+
+        int done = i + 1;
+        if (done == sampleCount || (done % progressTick) == 0)
+            WriteProgress(modeName, done, sampleCount);
+    }
+
+    if (firstWire != null && firstPlain != null)
+    {
+        WritePhase(modeName, "wrong-key check");
+        wrongKeyTotal++;
+        bool wrongKeyOk = wrongKeyBlockedOrGarbled(firstWire, firstPlain);
+        if (wrongKeyOk) wrongKeyPassed++;
+    }
+
+    WritePhase(modeName, "avalanche");
+    int avalancheCount = Math.Min(sampleCount, 2000);
+    var rngAval = new Random(seed ^ StableSeedFromLabel("avalanche-" + effectiveSeedLabel));
+    int avalancheTick = Math.Max(1, avalancheCount / 100);
+    WriteProgress(modeName + " avalanche", 0, avalancheCount);
+    for (int i = 0; i < avalancheCount; i++)
+    {
+        var plain = BuildAnalysisPayload(rngAval, i + 100_000);
+        var mutated = (byte[])plain.Clone();
+        int idx = i % mutated.Length;
+        mutated[idx] ^= (byte)(1 << (i % 8));
+        var wireA = encryptWire(plain);
+        var wireB = encryptWire(mutated);
+        var metricA = metricBytesSelector != null ? metricBytesSelector(wireA, plain) : wireA;
+        var metricB = metricBytesSelector != null ? metricBytesSelector(wireB, mutated) : wireB;
+        metricA ??= Array.Empty<byte>();
+        metricB ??= Array.Empty<byte>();
+        avalancheSamples.Add(ComputeNormalizedBitDistance(metricA, metricB));
+        int done = i + 1;
+        if (done == avalancheCount || (done % avalancheTick) == 0)
+            WriteProgress(modeName + " avalanche", done, avalancheCount);
+    }
+
+    WritePhase(modeName, "distinguisher");
+    int distinguisherCount = Math.Max(40, Math.Min(sampleCount, 4000));
+    if ((distinguisherCount & 1) != 0) distinguisherCount++;
+    double[] f0 = new double[distinguisherCount];
+    double[] f1 = new double[distinguisherCount];
+    var rngDist = new Random(seed ^ StableSeedFromLabel("distinguisher-" + effectiveSeedLabel));
+    int distTick = Math.Max(1, distinguisherCount / 100);
+    WriteProgress(modeName + " distinguisher", 0, distinguisherCount);
+    for (int i = 0; i < distinguisherCount; i++)
+    {
+        var p0 = BuildFilledPayload(128, 0x00);
+        var p1 = new byte[128];
+        rngDist.NextBytes(p1);
+        var w0 = encryptWire(p0);
+        var w1 = encryptWire(p1);
+        var m0 = metricBytesSelector != null ? metricBytesSelector(w0, p0) : w0;
+        var m1 = metricBytesSelector != null ? metricBytesSelector(w1, p1) : w1;
+        m0 ??= Array.Empty<byte>();
+        m1 ??= Array.Empty<byte>();
+        int t0 = Math.Min(16, m0.Length);
+        int t1 = Math.Min(16, m1.Length);
+        double s0 = 0d;
+        double s1 = 0d;
+        for (int j = 0; j < t0; j++) s0 += m0[j];
+        for (int j = 0; j < t1; j++) s1 += m1[j];
+        f0[i] = t0 > 0 ? s0 / t0 : 0d;
+        f1[i] = t1 > 0 ? s1 / t1 : 0d;
+        int done = i + 1;
+        if (done == distinguisherCount || (done % distTick) == 0)
+            WriteProgress(modeName + " distinguisher", done, distinguisherCount);
+    }
+    int split = distinguisherCount / 2;
+    double mean0 = 0d;
+    double mean1 = 0d;
+    for (int i = 0; i < split; i++)
+    {
+        mean0 += f0[i];
+        mean1 += f1[i];
+    }
+    mean0 /= split;
+    mean1 /= split;
+    int correct = 0;
+    int totalPred = 0;
+    for (int i = split; i < distinguisherCount; i++)
+    {
+        int pred0 = Math.Abs(f0[i] - mean0) <= Math.Abs(f0[i] - mean1) ? 0 : 1;
+        int pred1 = Math.Abs(f1[i] - mean0) <= Math.Abs(f1[i] - mean1) ? 0 : 1;
+        if (pred0 == 0) correct++;
+        if (pred1 == 1) correct++;
+        totalPred += 2;
+    }
+    double distinguisherAccuracy = totalPred > 0 ? correct / (double)totalPred : 0d;
+
+    WritePhase(modeName, "timing");
+    int timingCount = Math.Max(100, Math.Min(sampleCount, 2000));
+    var rngTiming = new Random(seed ^ StableSeedFromLabel("timing-" + effectiveSeedLabel));
+    var tGroupA = new List<double>(timingCount);
+    var tGroupB = new List<double>(timingCount);
+    int timingTick = Math.Max(1, timingCount / 100);
+    WriteProgress(modeName + " timing", 0, timingCount);
+    for (int i = 0; i < timingCount; i++)
+    {
+        var pA = BuildFilledPayload(256, 0x00);
+        var pB = new byte[256];
+        rngTiming.NextBytes(pB);
+
+        long sA = Stopwatch.GetTimestamp();
+        var _wa = encryptWire(pA);
+        long eA = Stopwatch.GetTimestamp();
+        tGroupA.Add((double)(eA - sA));
+
+        long sB = Stopwatch.GetTimestamp();
+        var _wb = encryptWire(pB);
+        long eB = Stopwatch.GetTimestamp();
+        tGroupB.Add((double)(eB - sB));
+        int done = i + 1;
+        if (done == timingCount || (done % timingTick) == 0)
+            WriteProgress(modeName + " timing", done, timingCount);
+    }
+    double timingT = ComputeWelchT(tGroupA, tGroupB);
+
+    double entropyGlobal = 0d;
+    double chiGlobal = 0d;
+    if (totalBytes > 0)
+    {
+        double expected = totalBytes / 256d;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] > 0)
+            {
+                double p = freq[i] / (double)totalBytes;
+                entropyGlobal -= p * (Math.Log(p) / Math.Log(2));
+            }
+            double diff = freq[i] - expected;
+            chiGlobal += (diff * diff) / expected;
+        }
+    }
+
+    double serialGlobal = 0d;
+    if (pairCount > 1)
+    {
+        double n = pairCount;
+        double num = n * pairSumXY - (pairSumX * pairSumY);
+        double denLeft = n * pairSumXX - (pairSumX * pairSumX);
+        double denRight = n * pairSumYY - (pairSumY * pairSumY);
+        double den = Math.Sqrt(Math.Max(0d, denLeft * denRight));
+        serialGlobal = den > 0 ? num / den : 0d;
+    }
+
+    double bitBalanceGlobal = totalBytes > 0 ? onesTotal / (8d * totalBytes) : 0d;
+    var wireLenStats = Summarize(wireLengths);
+    var avalancheStats = Summarize(avalancheSamples);
+    double avalancheP05 = Percentile(avalancheSamples, 0.05);
+    double avalancheP50 = Percentile(avalancheSamples, 0.50);
+    double avalancheP95 = Percentile(avalancheSamples, 0.95);
+
+    var flags = new List<string>();
+    bool isMvWire = modeName.IndexOf("mint-verify-wire", StringComparison.OrdinalIgnoreCase) >= 0;
+
+    // Entropy near 8.0 is desirable; only flag low entropy.
+    if (entropyGlobal < 7.90) flags.Add("entropy");
+
+    // Chi-square thresholds are view-specific:
+    // - mint-verify-wire includes structured protocol fields, so chi is informational only (no flag).
+    // - payload/symmetric keep broad guard rails to catch strong regressions.
+    if (!isMvWire)
+    {
+        double chiMin = 120.0;
+        double chiMax = 5000.0;
+        if (chiGlobal < chiMin || chiGlobal > chiMax) flags.Add("chi");
+    }
+
+    if (Math.Abs(serialGlobal) > 0.12) flags.Add("serial");
+    if (Math.Abs(bitBalanceGlobal - 0.5) > 0.02) flags.Add("bit-balance");
+    if (avalancheStats.Mean < 0.35 || avalancheStats.Mean > 0.65) flags.Add("avalanche");
+    if (distinguisherAccuracy > 0.56) flags.Add("distinguisher");
+    if (Math.Abs(timingT) > 5.0) flags.Add("timing");
+    WritePhase(modeName, "finalizing");
+
+    return new AnalysisModeResult
+    {
+        Mode = modeName,
+        SampleCount = sampleCount,
+        TotalBytes = totalBytes,
+        RoundtripPassed = roundtripPassed,
+        RoundtripTotal = roundtripTotal,
+        TamperBlockedPassed = tamperPassed,
+        TamperBlockedTotal = tamperTotal,
+        WrongKeyBlockedPassed = wrongKeyPassed,
+        WrongKeyBlockedTotal = wrongKeyTotal,
+        HardChecksPassed = roundtripPassed + tamperPassed + wrongKeyPassed,
+        HardChecksTotal = roundtripTotal + tamperTotal + wrongKeyTotal,
+        EntropyGlobal = entropyGlobal,
+        ChiSquareGlobal = chiGlobal,
+        SerialCorrelationGlobal = serialGlobal,
+        BitBalanceGlobal = bitBalanceGlobal,
+        WireLengthMean = wireLenStats.Mean,
+        WireLengthStdDev = wireLenStats.StdDev,
+        AvalancheMean = avalancheStats.Mean,
+        AvalancheStdDev = avalancheStats.StdDev,
+        AvalancheMin = avalancheStats.Min,
+        AvalancheMax = avalancheStats.Max,
+        AvalancheP05 = avalancheP05,
+        AvalancheP50 = avalancheP50,
+        AvalancheP95 = avalancheP95,
+        DistinguisherAccuracy = distinguisherAccuracy,
+        TimingTStatistic = timingT,
+        StatisticalFlags = flags
+    };
+}
+
+/// <summary>
+/// Print one mode summary with hard pass/fail and statistical metric flags.<br/>
+/// Intended as a reviewer-facing baseline snapshot before independent analysis work.<br/>
+/// </summary>
+/// <param name="result">Mode analysis result summary.<br/></param>
+void PrintModeAnalysisSummary(AnalysisModeResult result)
+{
+    bool roundtripPass = result.RoundtripPassed == result.RoundtripTotal;
+    bool tamperPass = result.TamperBlockedPassed == result.TamperBlockedTotal;
+    bool wrongKeyPass = result.WrongKeyBlockedPassed == result.WrongKeyBlockedTotal;
+    bool hardPass = result.HardChecksPassed == result.HardChecksTotal;
+    bool statsPass = result.StatisticalFlags.Count == 0;
+    WriteLineColor(ConsoleColor.Cyan, $"[analysis][{result.Mode}] samples={result.SampleCount} totalMetricBytes={result.TotalBytes}");
+    WriteLineColor(roundtripPass ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[analysis][{result.Mode}] roundtrip-checks: {result.RoundtripPassed}/{result.RoundtripTotal} {(roundtripPass ? "PASS" : "FAIL")}");
+    WriteLineColor(tamperPass ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[analysis][{result.Mode}] tamper-checks: {result.TamperBlockedPassed}/{result.TamperBlockedTotal} {(tamperPass ? "PASS" : "FAIL")}");
+    WriteLineColor(wrongKeyPass ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[analysis][{result.Mode}] wrong-key-checks: {result.WrongKeyBlockedPassed}/{result.WrongKeyBlockedTotal} {(wrongKeyPass ? "PASS" : "FAIL")}");
+    WriteLineColor(hardPass ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[analysis][{result.Mode}] hard-checks: {result.HardChecksPassed}/{result.HardChecksTotal} {(hardPass ? "PASS" : "FAIL")}");
+    if (!string.IsNullOrWhiteSpace(result.HardChecksInheritedFrom))
+        Console.WriteLine($"[analysis][{result.Mode}] hard-check-source: inherited-from={result.HardChecksInheritedFrom}");
+    WriteLineColor(statsPass ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[analysis][{result.Mode}] statistical-flags: {(statsPass ? "none" : string.Join("|", result.StatisticalFlags))}");
+    Console.WriteLine($"[analysis][{result.Mode}] entropy={Fmt(result.EntropyGlobal)} chi={Fmt(result.ChiSquareGlobal)} serial={Fmt(result.SerialCorrelationGlobal)} bitBalance={Fmt(result.BitBalanceGlobal)}");
+    Console.WriteLine($"[analysis][{result.Mode}] wireLenMean={Fmt(result.WireLengthMean)} wireLenStd={Fmt(result.WireLengthStdDev)}");
+    Console.WriteLine($"[analysis][{result.Mode}] avalancheMean={Fmt(result.AvalancheMean)} avalancheStd={Fmt(result.AvalancheStdDev)} range=[{Fmt(result.AvalancheMin)},{Fmt(result.AvalancheMax)}] p05={Fmt(result.AvalancheP05)} p50={Fmt(result.AvalancheP50)} p95={Fmt(result.AvalancheP95)}");
+    Console.WriteLine($"[analysis][{result.Mode}] distinguisherAccuracy={Fmt(result.DistinguisherAccuracy)} timingWelchT={Fmt(result.TimingTStatistic)}");
+}
+
+/// <summary>
+/// Run analysis suite for symmetric plus mint/verify wire/payload views, then export sample/summary CSV artifacts.<br/>
+/// Seed controls harness-generated payloads/mutations for reproducible sampling.<br/>
+/// </summary>
+/// <param name="profileLabel">Profile label (quick/deep/custom).<br/></param>
+/// <param name="sampleCount">Requested sample count.<br/></param>
+/// <param name="seed">Harness deterministic seed.<br/></param>
+void RunAnalysisSuite(string profileLabel, int sampleCount, int seed)
+{
+    WriteLineColor(ConsoleColor.Cyan, $"=== Analysis ({profileLabel}) ===");
+    Console.WriteLine($" seed(harness)={seed} sampleCount={sampleCount}");
+    Console.WriteLine(" note: seed controls harness payload/mutation generation; core library internal RNG remains internal.");
+
+    var sampleRows = new List<string>
+    {
+        "mode,sample_idx,plain_len,wire_len,metric_len,sample_entropy,sample_chi,sample_serial,tamper_index,tamper_outcome,roundtrip_ok,tamper_blocked"
+    };
+
+    bool oldMintDebug = Zifika.DebugMintVerify;
+    Zifika.DebugMintVerify = false;
+    try
+    {
+        var symSeedMain = BuildDeterministicSeedBytes(seed ^ 0x13572468);
+        var symSeedWrong = BuildDeterministicSeedBytes(seed ^ unchecked((int)0x89ABCDEF));
+        using var symKey = Zifika.CreateKey(symSeedMain, keySize: 8);
+        using var symWrong = Zifika.CreateKey(symSeedWrong, keySize: 8);
+        AnalysisModeResult symResult = RunModeAnalysisCore(
+            "symmetric",
+            sampleCount,
+            seed ^ StableSeedFromLabel("sym-core"),
+            plain =>
+            {
+                using var ct = Zifika.Encrypt(plain, symKey, useIntegrity: true);
+                return ct.ToArray();
+            },
+            (wire, plain) =>
+            {
+                using var dec = Zifika.Decrypt(new ZifikaBufferStream(wire), symKey, requireIntegrity: true);
+                return dec != null && plain.AsSpan().SequenceEqual(dec.AsReadOnlySpan);
+            },
+            (wire, plain) =>
+            {
+                bool ok = IsSymmetricBlockedOrGarbled(wire, plain, symKey, true, out string outcome);
+                return (ok, outcome);
+            },
+            (wire, plain) => IsSymmetricBlockedOrGarbled(wire, plain, symWrong, true, out _),
+            "symmetric",
+            null,
+            sampleRows);
+
+        var mainPair = Zifika.CreateMintingKeyPair();
+        var wrongPair = Zifika.CreateMintingKeyPair();
+        AnalysisModeResult mvWireResult = RunModeAnalysisCore(
+            "mint-verify-wire",
+            sampleCount,
+            seed ^ StableSeedFromLabel("mv-core"),
+            plain =>
+            {
+                using var ct = Zifika.Mint(plain, mainPair.minting, useIntegrity: true);
+                return ct.ToArray();
+            },
+            (wire, plain) =>
+            {
+                using var dec = Zifika.VerifyAndDecrypt(new ZifikaBufferStream(wire), mainPair.verifier, requireIntegrity: true);
+                return dec != null && plain.AsSpan().SequenceEqual(dec.AsReadOnlySpan);
+            },
+            (wire, plain) =>
+            {
+                bool ok = IsMintVerifyBlockedOrGarbled(wire, plain, mainPair.verifier, true, out string outcome);
+                return (ok, outcome);
+            },
+            (wire, plain) => IsMintVerifyBlockedOrGarbled(wire, plain, wrongPair.verifier, true, out _),
+            "mint-verify",
+            null,
+            sampleRows);
+
+        AnalysisModeResult mvPayloadResult = RunModeAnalysisCore(
+            "mint-verify-payload",
+            sampleCount,
+            seed ^ StableSeedFromLabel("mv-core"),
+            plain =>
+            {
+                using var ct = Zifika.Mint(plain, mainPair.minting, useIntegrity: true);
+                return ct.ToArray();
+            },
+            (wire, plain) =>
+            {
+                using var dec = Zifika.VerifyAndDecrypt(new ZifikaBufferStream(wire), mainPair.verifier, requireIntegrity: true);
+                return dec != null && plain.AsSpan().SequenceEqual(dec.AsReadOnlySpan);
+            },
+            (wire, plain) =>
+            {
+                bool ok = IsMintVerifyBlockedOrGarbled(wire, plain, mainPair.verifier, true, out string outcome);
+                return (ok, outcome);
+            },
+            (wire, plain) => IsMintVerifyBlockedOrGarbled(wire, plain, wrongPair.verifier, true, out _),
+            "mint-verify",
+            (wire, plain) => ExtractMintVerifyPayloadSegment(wire, plain.Length, hasIntegritySeal: true),
+            sampleRows);
+
+        // Payload view is a statistical lens over the same mode, not an independent hard-check gate.
+        // Inherit hard-check outcomes from the mint-verify wire run to avoid independent RNG noise.
+        mvPayloadResult.RoundtripPassed = mvWireResult.RoundtripPassed;
+        mvPayloadResult.RoundtripTotal = mvWireResult.RoundtripTotal;
+        mvPayloadResult.TamperBlockedPassed = mvWireResult.TamperBlockedPassed;
+        mvPayloadResult.TamperBlockedTotal = mvWireResult.TamperBlockedTotal;
+        mvPayloadResult.WrongKeyBlockedPassed = mvWireResult.WrongKeyBlockedPassed;
+        mvPayloadResult.WrongKeyBlockedTotal = mvWireResult.WrongKeyBlockedTotal;
+        mvPayloadResult.HardChecksPassed = mvWireResult.HardChecksPassed;
+        mvPayloadResult.HardChecksTotal = mvWireResult.HardChecksTotal;
+        mvPayloadResult.HardChecksInheritedFrom = mvWireResult.Mode;
+
+        PrintModeAnalysisSummary(symResult);
+        PrintModeAnalysisSummary(mvWireResult);
+        PrintModeAnalysisSummary(mvPayloadResult);
+
+        string artifactsDir = ResolveArtifactsDirectory();
+        string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+        string profileSlug = profileLabel.Replace(' ', '-').ToLowerInvariant();
+        string samplePath = Path.Combine(artifactsDir, $"analysis_samples_{profileSlug}_{stamp}.csv");
+        string summaryPath = Path.Combine(artifactsDir, $"analysis_summary_{profileSlug}_{stamp}.csv");
+
+        File.WriteAllLines(samplePath, sampleRows);
+        var summaryRows = new List<string>
+        {
+            "mode,sample_count,total_metric_bytes,roundtrip_passed,roundtrip_total,tamper_passed,tamper_total,wrong_key_passed,wrong_key_total,hard_passed,hard_total,entropy_global,chi_global,serial_global,bit_balance_global,metric_len_mean,metric_len_std,avalanche_mean,avalanche_std,avalanche_min,avalanche_max,avalanche_p05,avalanche_p50,avalanche_p95,distinguisher_accuracy,timing_welch_t,stat_flags"
+        };
+        void AddSummaryRow(AnalysisModeResult r)
+        {
+            summaryRows.Add(string.Join(",",
+                r.Mode,
+                r.SampleCount.ToString(CultureInfo.InvariantCulture),
+                r.TotalBytes.ToString(CultureInfo.InvariantCulture),
+                r.RoundtripPassed.ToString(CultureInfo.InvariantCulture),
+                r.RoundtripTotal.ToString(CultureInfo.InvariantCulture),
+                r.TamperBlockedPassed.ToString(CultureInfo.InvariantCulture),
+                r.TamperBlockedTotal.ToString(CultureInfo.InvariantCulture),
+                r.WrongKeyBlockedPassed.ToString(CultureInfo.InvariantCulture),
+                r.WrongKeyBlockedTotal.ToString(CultureInfo.InvariantCulture),
+                r.HardChecksPassed.ToString(CultureInfo.InvariantCulture),
+                r.HardChecksTotal.ToString(CultureInfo.InvariantCulture),
+                Fmt(r.EntropyGlobal),
+                Fmt(r.ChiSquareGlobal),
+                Fmt(r.SerialCorrelationGlobal),
+                Fmt(r.BitBalanceGlobal),
+                Fmt(r.WireLengthMean),
+                Fmt(r.WireLengthStdDev),
+                Fmt(r.AvalancheMean),
+                Fmt(r.AvalancheStdDev),
+                Fmt(r.AvalancheMin),
+                Fmt(r.AvalancheMax),
+                Fmt(r.AvalancheP05),
+                Fmt(r.AvalancheP50),
+                Fmt(r.AvalancheP95),
+                Fmt(r.DistinguisherAccuracy),
+                Fmt(r.TimingTStatistic),
+                r.StatisticalFlags.Count == 0 ? "none" : string.Join("|", r.StatisticalFlags)));
+        }
+        AddSummaryRow(symResult);
+        AddSummaryRow(mvWireResult);
+        AddSummaryRow(mvPayloadResult);
+        File.WriteAllLines(summaryPath, summaryRows);
+
+        WriteLineColor(ConsoleColor.Yellow, $"[analysis] samples csv: {samplePath}");
+        WriteLineColor(ConsoleColor.Yellow, $"[analysis] summary csv: {summaryPath}");
+        Console.WriteLine();
+    }
+    finally
+    {
+        Zifika.DebugMintVerify = oldMintDebug;
+    }
+}
+
+/// <summary>
+/// Analysis menu with Quick/Deep profiles and optional overrides for sample count and deterministic harness seed.<br/>
+/// Outputs hard pass/fail and statistical metric flags plus CSV artifacts for external review.<br/>
+/// </summary>
+void RunAnalysisMenu()
+{
+    breadcrumb = new List<string> { "Main", "Analysis" };
+    const int quickDefault = 1000;
+    const int deepDefault = 20000;
+    int quickSeedDefault = StableSeedFromLabel("analysis-quick-v1");
+    int deepSeedDefault = StableSeedFromLabel("analysis-deep-v1");
+
+    while (true)
+    {
+        Console.WriteLine();
+        PrintBreadcrumb();
+        WriteLineColor(ConsoleColor.Cyan, "Analysis menu:");
+        Console.WriteLine($"  A) Quick profile (default samples:{quickDefault})");
+        Console.WriteLine($"  B) Deep profile (default samples:{deepDefault})");
+        Console.WriteLine("  X) Back (ESC)");
+        var choice = ReadChoiceKey("Select (A/B/X or ESC): ", "A", "B", "X");
+        if (choice == "ESC" || string.Equals(choice, "X", StringComparison.OrdinalIgnoreCase)) return;
+
+        if (string.Equals(choice, "A", StringComparison.OrdinalIgnoreCase))
+        {
+            int count = ReadOptionalPositiveInt($"Sample count (blank={quickDefault}): ", quickDefault, 1, 500000);
+            int seed = ReadOptionalSeedInt($"Harness seed (Int32, blank={quickSeedDefault}): ", quickSeedDefault);
+            RunAnalysisSuite("quick", count, seed);
+            continue;
+        }
+
+        if (string.Equals(choice, "B", StringComparison.OrdinalIgnoreCase))
+        {
+            int count = ReadOptionalPositiveInt($"Sample count (blank={deepDefault}): ", deepDefault, 1, 500000);
+            int seed = ReadOptionalSeedInt($"Harness seed (Int32, blank={deepSeedDefault}): ", deepSeedDefault);
+            RunAnalysisSuite("deep", count, seed);
+            continue;
+        }
+    }
 }
 
 /// <summary>
@@ -2710,13 +3596,15 @@ void RunZifikaPrimer()
         Console.WriteLine("  S) Symmetric (encrypt/decrypt)");
         Console.WriteLine("  A) Mint/Verify");
         Console.WriteLine("  T) Attack simulations");
+        Console.WriteLine("  Y) Analysis");
         Console.WriteLine($"  ?) {GlossaryLabel}");
         Console.WriteLine("  X) Exit");
-        var choice = ReadChoiceKey("Select (S/A/T/?/X or ESC): ", "S", "A", "T", "?", "X");
+        var choice = ReadChoiceKey("Select (S/A/T/Y/?/X or ESC): ", "S", "A", "T", "Y", "?", "X");
         if (choice == "ESC" || string.Equals(choice, "X", StringComparison.OrdinalIgnoreCase)) return;
         if (string.Equals(choice, "S", StringComparison.OrdinalIgnoreCase)) RunSymmetricMenu();
         else if (string.Equals(choice, "A", StringComparison.OrdinalIgnoreCase)) RunMintVerifyMenu();
         else if (string.Equals(choice, "T", StringComparison.OrdinalIgnoreCase)) RunAttackSimulationMenu();
+        else if (string.Equals(choice, "Y", StringComparison.OrdinalIgnoreCase)) RunAnalysisMenu();
         else if (string.Equals(choice, "?", StringComparison.OrdinalIgnoreCase)) RunGlossaryMenu(GlossaryContextMain);
     }
 }
@@ -2731,4 +3619,36 @@ class GlossaryNode
     public GlossaryNode Parent { get; set; }
     public List<GlossaryNode> Children { get; } = new();
     public List<string> TextLines { get; } = new();
+}
+
+class AnalysisModeResult
+{
+    public string Mode { get; set; }
+    public int SampleCount { get; set; }
+    public long TotalBytes { get; set; }
+    public int RoundtripPassed { get; set; }
+    public int RoundtripTotal { get; set; }
+    public int TamperBlockedPassed { get; set; }
+    public int TamperBlockedTotal { get; set; }
+    public int WrongKeyBlockedPassed { get; set; }
+    public int WrongKeyBlockedTotal { get; set; }
+    public int HardChecksPassed { get; set; }
+    public int HardChecksTotal { get; set; }
+    public string HardChecksInheritedFrom { get; set; }
+    public double EntropyGlobal { get; set; }
+    public double ChiSquareGlobal { get; set; }
+    public double SerialCorrelationGlobal { get; set; }
+    public double BitBalanceGlobal { get; set; }
+    public double WireLengthMean { get; set; }
+    public double WireLengthStdDev { get; set; }
+    public double AvalancheMean { get; set; }
+    public double AvalancheStdDev { get; set; }
+    public double AvalancheMin { get; set; }
+    public double AvalancheMax { get; set; }
+    public double AvalancheP05 { get; set; }
+    public double AvalancheP50 { get; set; }
+    public double AvalancheP95 { get; set; }
+    public double DistinguisherAccuracy { get; set; }
+    public double TimingTStatistic { get; set; }
+    public List<string> StatisticalFlags { get; set; } = new();
 }

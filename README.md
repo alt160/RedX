@@ -100,7 +100,7 @@ A per‑message byte array called the **interference catalyst** (`intCat`) is a 
 When enabled, Zifika appends an encrypted integrity seal to the ciphertext.
 
 - Seal length: **32 bytes (256 bits)** in the current implementation.
-- Seal material: `integritySeal32B = Blake3(rowEncodedStream || intCat)`.
+- Seal material: `integritySeal32B = Blake3(enc(startLocation1Bit) || rowEncodedStream || intCat)`.
 - The seal bytes are appended **in mapped (encrypted) form**.
 
 Decryption recomputes the expected seal and compares it to the decrypted seal. If the integrity check fails, decryption returns `null`. Plaintext is not materialized internally unless verification succeeds.
@@ -191,7 +191,7 @@ Where `enc(...)` means Zifika mapping using the full key.
 
 Integrity seal, when enabled:
 
-- `integritySeal32B = Blake3(rowOffsetStream || intCat) (32 bytes)`
+- `integritySeal32B = Blake3(enc(startLocation1Bit) || rowOffsetStream || intCat) (32 bytes)`
 - It is appended in encrypted form.
 
 ### Mint and Verify mode layout
@@ -267,4 +267,3 @@ See the LICENSE file for details.
 ```bash
 dotnet build
 ```
-

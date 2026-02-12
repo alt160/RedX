@@ -201,6 +201,7 @@ namespace ZifikaLib
         /// <summary>
         /// Symmetric decrypt using the full key.<br/>
         /// Assumes the symmetric wire layout: enc(startLocation1Bit) | enc(intCatLen) | enc(intCat) | key-row offset stream | [enc(integritySeal, optional)].<br/>
+        /// Integrity seal binds the raw encrypted startLocation header bytes plus (row-offset stream || intCat), so header-bit tampering is detected.<br/>
         /// When requireIntegrity is true, a 32-byte integrity seal must be present and valid; when false, no integrity seal is expected. Missing/invalid integrity fails decryption (no fallback).<br/>
         /// </summary>
         public static ZifikaBufferStream Decrypt(ZifikaBufferStream ciphertext, ZifikaKey key, bool requireIntegrity = true)
@@ -216,7 +217,7 @@ namespace ZifikaLib
 
             try
             {
-                if (!TryReadStartLocation1Bit(key, ciphertext, default, out ushort startLocationU16)) return null;
+                if (!TryReadStartLocation1Bit(key, ciphertext, default, out ushort startLocationU16, out byte[] startLocationHeaderBytes)) return null;
                 var startLocation = unchecked((short)startLocationU16);
                 using var intCatLenPlain = key.UnmapData(ciphertext, 0, default, 1);
                 if (intCatLenPlain == null || intCatLenPlain.Length != 1) return null;
@@ -241,6 +242,7 @@ namespace ZifikaLib
                 {
                     if (integrityBytes.Length != 32) return null;
                     var b3 = Blake3.Hasher.New();
+                    b3.Update(startLocationHeaderBytes);
                     b3.Update(rowOffsetBytes);
                     b3.Update(intCat.AsReadOnlySpan);
                     Span<byte> integrity2 = stackalloc byte[32];
@@ -281,7 +283,7 @@ namespace ZifikaLib
         /// <summary>
         /// Symmetric encrypt using only the full key.<br/>
         /// Wire layout: enc(startLocation1Bit) | enc(intCatLen) | enc(intCat) | key-row offset stream | [enc(integritySeal, optional when useIntegrity=true)].<br/>
-        /// Integrity seal is computed over key-row offset stream||intCat; when useIntegrity is false the seal is omitted entirely.<br/>
+        /// Integrity seal is computed over enc(startLocation1Bit)||key-row offset stream||intCat; when useIntegrity is false the seal is omitted entirely.<br/>
         /// </summary>
         public static ZifikaBufferStream Encrypt(byte[] data, ZifikaKey key, bool useIntegrity = true)
         {
@@ -301,8 +303,12 @@ namespace ZifikaLib
                 ushort startLocation = (ushort)RandomNumberGenerator.GetInt32(0, Math.Min(key.key.Length, ushort.MaxValue + 1));
                 short startLocationShort = unchecked((short)startLocation);
                 startBuf = startLocation.To1BitEncodedBytes(randomizeUnusedBits: true);
+                byte[] startHeaderBytes;
                 using (var startEnc = key.MapData(startBuf, 0))
-                    ret.Write(startEnc);
+                {
+                    startHeaderBytes = startEnc.AsReadOnlySpan.ToArray();
+                    ret.Write(startHeaderBytes);
+                }
 
                 // 2) interference catalyst header (len + encrypted catalyst)
                 var intCatLen = (byte)RandomNumberGenerator.GetInt32(7, 64);
@@ -328,6 +334,7 @@ namespace ZifikaLib
                 {
                     Span<byte> integritySeal = stackalloc byte[32];
                     var b3 = Blake3.Hasher.New();
+                    b3.Update(startHeaderBytes);
                     b3.Update(rowOffsetBytes);
                     b3.Update(intCat);
                     b3.Finalize(integritySeal);
@@ -561,21 +568,25 @@ namespace ZifikaLib
         /// <summary>
         /// Read a 1-bit encoded start location from a full-key mapped header stream.<br/>
         /// Consumes mapped bytes from <paramref name="ciphertext"/> until the 1-bit varint terminates.<br/>
+        /// Returns the exact raw mapped header bytes consumed so integrity verification can bind header bytes, not just decoded value.<br/>
         /// Returns false on decode failure, unexpected EOF, or non-canonical encoding.<br/>
         /// </summary>
         /// <param name="key">Full key used to unmap the header bytes.<br/></param>
         /// <param name="ciphertext">Ciphertext stream positioned at the startLocation field.<br/></param>
         /// <param name="intCat">Header interference catalyst (vKeyLock for verifier headers, empty for symmetric).<br/></param>
         /// <param name="startLocation">Decoded start location value (ushort range).<br/></param>
+        /// <param name="startLocationHeaderBytes">Raw mapped bytes consumed for the 1-bit encoded start location.<br/></param>
         /// <returns>True on success; false on failure.<br/></returns>
-        private static bool TryReadStartLocation1Bit(ZifikaKey key, ZifikaBufferStream ciphertext, ReadOnlySpan<byte> intCat, out ushort startLocation)
+        private static bool TryReadStartLocation1Bit(ZifikaKey key, ZifikaBufferStream ciphertext, ReadOnlySpan<byte> intCat, out ushort startLocation, out byte[] startLocationHeaderBytes)
         {
             startLocation = 0;
+            startLocationHeaderBytes = null;
             if (key == null || ciphertext == null) return false;
             try
             {
                 const int MaxBytes = 16; // ushort = 16 bits
                 Span<byte> buf = stackalloc byte[MaxBytes];
+                Span<byte> mapped = stackalloc byte[MaxBytes];
                 int idx = 0;
                 bool terminated = false;
 
@@ -591,6 +602,7 @@ namespace ZifikaLib
                 {
                     int cipherVal = ciphertext.ReadByte();
                     if (cipherVal < 0) return false;
+                    mapped[idx] = (byte)cipherVal;
 
                     ushort jump = bx.NextJump16();
 
@@ -624,7 +636,9 @@ namespace ZifikaLib
 
                 ReadOnlySpan<byte> ro = buf.Slice(0, idx);
                 startLocation = Integer1BitEncodingExtensions.Read1BitEncodedUInt16(ro, out int bytesRead);
-                return bytesRead == idx;
+                if (bytesRead != idx) return false;
+                startLocationHeaderBytes = mapped.Slice(0, idx).ToArray();
+                return true;
             }
             catch
             {
@@ -850,7 +864,7 @@ namespace ZifikaLib
 
         // Lightweight toggle for temporary mint/verify tracing; set false to silence.
         //======  FIELDS  ======
-        internal const bool DebugMintVerify = true;
+        public static bool DebugMintVerify { get; set; } = true;
         internal const int VerifyingKeyLockSize = 16;
         // Default cap on embedded checkpoint signatures (mint/verify mode)
         internal const int DefaultAuthorityCheckpointMax = 64;
@@ -2558,6 +2572,13 @@ namespace ZifikaLib
                 int dist = rkdFlat[rowBase + (byte)cipherVal];
                 int newCol = (landingCol + dist) & 0xFF;
                 int flatIndex = curRow * 256 + newCol;
+                ushort expectedNonce = noncesSpan[flatIndex];
+
+                if (perPositionNonces != null && i < perPositionNonces.Length && perPositionNonces[i] != expectedNonce)
+                {
+                    Zifika.DebugMint($"UnmapDataWithRkd(v2) nonce mismatch i={i} flat={flatIndex} expected={expectedNonce} got={perPositionNonces[i]}");
+                    return null;
+                }
 
                 byte plain;
                 if (useDirectKeyBytes)
@@ -2566,7 +2587,7 @@ namespace ZifikaLib
                 }
                 else
                 {
-                    ushort r = perPositionNonces != null && i < perPositionNonces.Length ? perPositionNonces[i] : noncesSpan[flatIndex];
+                    ushort r = perPositionNonces != null && i < perPositionNonces.Length ? perPositionNonces[i] : expectedNonce;
                     uint h32 = Zifika.ComputeH32(keyHash.Span, flatIndex, r);
                     if (!map.TryGetValue(h32, out plain))
                     {
