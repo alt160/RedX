@@ -110,6 +110,7 @@ string lastMintCipherHex = null;
 string lastMintPlainHex = null;
 
 bool showMintVerifyIntro = true;
+bool attackSimulationDetail = false;
 
 const string GlossaryLabel = "Learn more / Glossary of terms";
 const string GlossaryContextMain = "main";
@@ -1471,6 +1472,225 @@ List<(string Label, byte[] Payload)> BuildPresetPayloads()
 }
 
 /// <summary>
+/// Build a deterministic payload by repeating a caller-provided byte seed.<br/>
+/// This overload avoids UTF-8 conversion so non-text byte patterns remain exact.<br/>
+/// </summary>
+/// <param name="length">Requested output length in bytes.<br/></param>
+/// <param name="seed">Non-empty seed bytes repeated to fill output.<br/></param>
+/// <returns>Deterministic byte array of requested length.<br/></returns>
+byte[] BuildPatternPayloadBytes(int length, ReadOnlySpan<byte> seed)
+{
+    if (seed.IsEmpty) throw new ArgumentException("Seed cannot be empty", nameof(seed));
+    if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));
+    var data = new byte[length];
+    for (int i = 0; i < length; i++)
+        data[i] = seed[i % seed.Length];
+    return data;
+}
+
+/// <summary>
+/// Build a deterministic payload fully filled with one byte value.<br/>
+/// Used for non-typical all-zero/all-0xFF attack inputs.<br/>
+/// </summary>
+/// <param name="length">Requested output length in bytes.<br/></param>
+/// <param name="value">Byte value to repeat.<br/></param>
+/// <returns>Filled byte array of requested length.<br/></returns>
+byte[] BuildFilledPayload(int length, byte value)
+{
+    if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));
+    var data = new byte[length];
+    data.AsSpan().Fill(value);
+    return data;
+}
+
+/// <summary>
+/// Build attack-focused payloads that include both typical and non-typical byte distributions.<br/>
+/// The set is intentionally small and deterministic so critics can reproduce outcomes quickly.<br/>
+/// </summary>
+/// <returns>Label/payload pairs for attack simulation runs.<br/></returns>
+List<(string Label, byte[] Payload)> BuildAttackPayloads()
+{
+    return new List<(string, byte[])>
+    {
+        ("typical-plain-64", BuildPatternPayload(64, "the-quick-brown-fox-jumps-over-lazy-dog-")),
+        ("typical-plain-1024", BuildPatternPayload(1024, "sane-user-input-path-walk-coverage-")),
+        ("nontypical-len-1-zero", new byte[] { 0x00 }),
+        ("nontypical-all-zero-128", BuildFilledPayload(128, 0x00)),
+        ("nontypical-all-ff-128", BuildFilledPayload(128, 0xFF)),
+        ("nontypical-repeater-257", BuildPatternPayload(257, "AAAAABBBBBCCCCCDDDDDEEEEE")),
+        ("nontypical-binary-513", BuildPatternPayloadBytes(513, new byte[] { 0x00, 0x01, 0x02, 0x03, 0x1B, 0x7E, 0x7F, 0x80, 0xFF }))
+    };
+}
+
+/// <summary>
+/// Produce a stable 32-bit seed from text for deterministic fuzz mutation generation.<br/>
+/// This avoids runtime-randomized string hash behavior so runs are reproducible.<br/>
+/// </summary>
+/// <param name="text">Input label text.<br/></param>
+/// <returns>Deterministic signed 32-bit seed.<br/></returns>
+int StableSeedFromLabel(string text)
+{
+    if (text == null) throw new ArgumentNullException(nameof(text));
+    unchecked
+    {
+        int hash = (int)2166136261;
+        for (int i = 0; i < text.Length; i++)
+            hash = (hash ^ text[i]) * 16777619;
+        return hash;
+    }
+}
+
+/// <summary>
+/// Clone ciphertext and flip one byte by XOR mask at a clamped index.<br/>
+/// Indexes outside range are clamped so the mutation always applies when input is non-empty.<br/>
+/// </summary>
+/// <param name="src">Source byte array to mutate.<br/></param>
+/// <param name="index">Target index before clamping.<br/></param>
+/// <param name="mask">XOR bitmask to apply (defaults to 0x01).<br/></param>
+/// <returns>Mutated clone (or empty clone when source is empty).<br/></returns>
+byte[] MutateFlipByte(ReadOnlySpan<byte> src, int index, byte mask = 0x01)
+{
+    var dst = src.ToArray();
+    if (dst.Length == 0) return dst;
+    if (index < 0) index = 0;
+    if (index >= dst.Length) index = dst.Length - 1;
+    dst[index] ^= mask;
+    return dst;
+}
+
+/// <summary>
+/// Clone ciphertext and truncate tail bytes.<br/>
+/// If trim exceeds length the result is empty.<br/>
+/// </summary>
+/// <param name="src">Source byte array to mutate.<br/></param>
+/// <param name="trimBytes">Number of tail bytes to remove.<br/></param>
+/// <returns>Truncated clone.<br/></returns>
+byte[] MutateTruncate(ReadOnlySpan<byte> src, int trimBytes)
+{
+    if (trimBytes < 0) throw new ArgumentOutOfRangeException(nameof(trimBytes));
+    int keep = src.Length - trimBytes;
+    if (keep < 0) keep = 0;
+    return src.Slice(0, keep).ToArray();
+}
+
+/// <summary>
+/// Clone ciphertext and append caller-provided bytes.<br/>
+/// Used to simulate trailing garbage and framing extension attacks.<br/>
+/// </summary>
+/// <param name="src">Source byte array to mutate.<br/></param>
+/// <param name="tail">Bytes to append.<br/></param>
+/// <returns>Extended clone.<br/></returns>
+byte[] MutateAppend(ReadOnlySpan<byte> src, ReadOnlySpan<byte> tail)
+{
+    var dst = new byte[src.Length + tail.Length];
+    src.CopyTo(dst);
+    tail.CopyTo(dst.AsSpan(src.Length));
+    return dst;
+}
+
+/// <summary>
+/// Splice two ciphertexts by taking first half from A and second half from B.<br/>
+/// This simulates cross-message grafting attacks that break transcript continuity.<br/>
+/// </summary>
+/// <param name="a">Primary ciphertext.<br/></param>
+/// <param name="b">Peer ciphertext donor.<br/></param>
+/// <returns>Spliced ciphertext clone.<br/></returns>
+byte[] MutateSpliceHalf(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+{
+    if (a.IsEmpty) return a.ToArray();
+    if (b.IsEmpty) return a.ToArray();
+    int split = a.Length / 2;
+    int tailLen = b.Length - (b.Length / 2);
+    var dst = new byte[split + tailLen];
+    a.Slice(0, split).CopyTo(dst);
+    b.Slice(b.Length / 2, tailLen).CopyTo(dst.AsSpan(split));
+    return dst;
+}
+
+/// <summary>
+/// Attempt symmetric decrypt on tampered ciphertext and classify outcome as blocked/garbled or unexpected accept.<br/>
+/// "Blocked/garbled" means null result, exception, or plaintext mismatch against original.<br/>
+/// </summary>
+/// <param name="tampered">Tampered ciphertext bytes.<br/></param>
+/// <param name="originalPlain">Original plaintext bytes for match check.<br/></param>
+/// <param name="key">Symmetric key used for decryption.<br/></param>
+/// <param name="requireIntegrity">Integrity requirement flag passed to decrypt.<br/></param>
+/// <param name="outcome">Human-readable outcome detail for logging.<br/></param>
+/// <returns>True when attack was blocked or produced garbled output; false on unexpected perfect recovery.<br/></returns>
+bool IsSymmetricBlockedOrGarbled(byte[] tampered, ReadOnlySpan<byte> originalPlain, ZifikaKey key, bool requireIntegrity, out string outcome)
+{
+    try
+    {
+        using var dec = Zifika.Decrypt(new ZifikaBufferStream(tampered), key, requireIntegrity);
+        if (dec == null)
+        {
+            outcome = "blocked(null)";
+            return true;
+        }
+        var recovered = dec.ToArray();
+        bool match = originalPlain.SequenceEqual(recovered);
+        outcome = match ? $"unexpected-match(len:{recovered.Length})" : $"garbled(len:{recovered.Length})";
+        return !match;
+    }
+    catch (Exception ex)
+    {
+        outcome = $"blocked(exception:{ex.GetType().Name})";
+        return true;
+    }
+}
+
+/// <summary>
+/// Attempt verify/decrypt on tampered ciphertext and classify outcome as blocked/garbled or unexpected accept.<br/>
+/// "Blocked/garbled" means null result, exception, or plaintext mismatch against original.<br/>
+/// </summary>
+/// <param name="tampered">Tampered ciphertext bytes.<br/></param>
+/// <param name="originalPlain">Original plaintext bytes for match check.<br/></param>
+/// <param name="verifier">Verifier key used for verify/decrypt.<br/></param>
+/// <param name="requireIntegrity">Integrity requirement flag passed to verify/decrypt.<br/></param>
+/// <param name="outcome">Human-readable outcome detail for logging.<br/></param>
+/// <returns>True when attack was blocked or produced garbled output; false on unexpected perfect recovery.<br/></returns>
+bool IsMintVerifyBlockedOrGarbled(byte[] tampered, ReadOnlySpan<byte> originalPlain, ZifikaVerifierKey verifier, bool requireIntegrity, out string outcome)
+{
+    try
+    {
+        using var dec = Zifika.VerifyAndDecrypt(new ZifikaBufferStream(tampered), verifier, requireIntegrity: requireIntegrity);
+        if (dec == null)
+        {
+            outcome = "blocked(null)";
+            return true;
+        }
+        var recovered = dec.ToArray();
+        bool match = originalPlain.SequenceEqual(recovered);
+        outcome = match ? $"unexpected-match(len:{recovered.Length})" : $"garbled(len:{recovered.Length})";
+        return !match;
+    }
+    catch (Exception ex)
+    {
+        outcome = $"blocked(exception:{ex.GetType().Name})";
+        return true;
+    }
+}
+
+/// <summary>
+/// Emit one attack result line in red so attack context is visually explicit in the console output.<br/>
+/// Optional detail mode appends a ciphertext preview for reproducibility/debugging.<br/>
+/// </summary>
+/// <param name="mode">Mode label (e.g., "sym" or "m/v").<br/></param>
+/// <param name="payloadLabel">Payload case label.<br/></param>
+/// <param name="attackName">Attack case label.<br/></param>
+/// <param name="blockedOrGarbled">Outcome classification flag.<br/></param>
+/// <param name="outcome">Outcome detail text.<br/></param>
+/// <param name="detail">Whether to print tampered ciphertext preview.<br/></param>
+/// <param name="tampered">Tampered ciphertext bytes.<br/></param>
+void PrintAttackLine(string mode, string payloadLabel, string attackName, bool blockedOrGarbled, string outcome, bool detail, ReadOnlySpan<byte> tampered)
+{
+    WriteLineColor(ConsoleColor.Red,
+        $"[{mode}-attack][{payloadLabel}] {attackName}: blocked-or-garbled={blockedOrGarbled} ({outcome})");
+    if (detail)
+        WriteLineColor(ConsoleColor.Red, $"[{mode}-attack][{payloadLabel}] tampered: {HexWithLen(tampered, 32)}");
+}
+
+/// <summary>
 /// Render a hex preview with length tag and optional truncation for large buffers.<br/>
 /// </summary>
 string HexWithLen(ReadOnlySpan<byte> data, int previewBytes = 64)
@@ -1712,6 +1932,56 @@ ZifikaKey ResolveSymmetricKey()
 }
 
 /// <summary>
+/// Run a deterministic forced-transcript regression where plaintexts differ only at byte 0 and must not re-synchronize from byte 2 onward.<br/>
+/// Uses a deterministic key seed plus explicit startLocation/intCat to force identical transcript inputs across both encryptions.<br/>
+/// Also verifies both ciphertexts still roundtrip through UnmapData to preserve symmetric correctness.<br/>
+/// </summary>
+/// <returns>
+/// A tuple containing pass/fail state, roundtrip results, suffix-divergence result, and both ciphertexts for optional diagnostics.<br/>
+/// </returns>
+(bool Passed, bool RoundtripA, bool RoundtripB, bool SuffixDifferent, byte[] CipherA, byte[] CipherB) RunForcedTranscriptDivergenceRegression()
+{
+    byte[] seed = new byte[]
+    {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0x0F
+    };
+    using var deterministicKey = Zifika.CreateKey(seed, keySize: 8);
+
+    const short startLocation = unchecked((short)0x3A5C);
+    byte[] intCat = Encoding.ASCII.GetBytes("forced-transcript-cat");
+
+    byte[] plainA = Encoding.ASCII.GetBytes("zifika-regression-plaintext");
+    byte[] plainB = (byte[])plainA.Clone();
+    plainB[0] ^= 0x5A;
+
+    byte[] cipherABytes;
+    using (var cipherA = deterministicKey.MapData(plainA, startLocation, intCat))
+        cipherABytes = cipherA.AsReadOnlySpan.ToArray();
+
+    byte[] cipherBBytes;
+    using (var cipherB = deterministicKey.MapData(plainB, startLocation, intCat))
+        cipherBBytes = cipherB.AsReadOnlySpan.ToArray();
+
+    bool suffixDifferent;
+    if (cipherABytes.Length > 2 && cipherBBytes.Length > 2)
+        suffixDifferent = !cipherABytes.AsSpan(2).SequenceEqual(cipherBBytes.AsSpan(2));
+    else
+        suffixDifferent = !cipherABytes.AsSpan().SequenceEqual(cipherBBytes.AsSpan());
+
+    bool roundtripA;
+    using (var recoveredA = deterministicKey.UnmapData(new ZifikaBufferStream(cipherABytes), startLocation, intCat))
+        roundtripA = recoveredA != null && plainA.AsSpan().SequenceEqual(recoveredA.AsReadOnlySpan);
+
+    bool roundtripB;
+    using (var recoveredB = deterministicKey.UnmapData(new ZifikaBufferStream(cipherBBytes), startLocation, intCat))
+        roundtripB = recoveredB != null && plainB.AsSpan().SequenceEqual(recoveredB.AsReadOnlySpan);
+
+    bool passed = roundtripA && roundtripB && suffixDifferent;
+    return (passed, roundtripA, roundtripB, suffixDifferent, cipherABytes, cipherBBytes);
+}
+
+/// <summary>
 /// Run pre-canned symmetric encrypt/decrypt pairs with the current key and print before/after info.<br/>
 /// </summary>
 void RunSymmetricPreset(ZifikaKey key, bool useIntegrity)
@@ -1734,6 +2004,114 @@ void RunSymmetricPreset(ZifikaKey key, bool useIntegrity)
             $"[{label}] Plaintext Decrypt Matches Original: {match}");
         Console.WriteLine();
     }
+
+    var regression = RunForcedTranscriptDivergenceRegression();
+    WriteLineColor(ConsoleColor.Cyan, "[Regression] Forced transcript divergence");
+    Console.WriteLine($"[Regression] Cipher A: {HexWithLen(regression.CipherA)}");
+    Console.WriteLine($"[Regression] Cipher B: {HexWithLen(regression.CipherB)}");
+    WriteLineColor(regression.SuffixDifferent ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[Regression] Cipher suffixes from byte 2 differ: {regression.SuffixDifferent}");
+    WriteLineColor(regression.RoundtripA ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[Regression] Roundtrip A passed: {regression.RoundtripA}");
+    WriteLineColor(regression.RoundtripB ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[Regression] Roundtrip B passed: {regression.RoundtripB}");
+    WriteLineColor(regression.Passed ? ConsoleColor.Green : ConsoleColor.Red,
+        $"[Regression] Forced transcript non-resync overall: {regression.Passed}");
+    Console.WriteLine();
+}
+
+/// <summary>
+/// Run symmetric attack simulations against deterministic ciphertexts and report whether tampering is blocked or garbles output.<br/>
+/// Intended as sample code for reviewers to reproduce common manipulation attempts without editing core library code.<br/>
+/// </summary>
+/// <param name="requireIntegrity">Integrity requirement used during decrypt attempts.<br/></param>
+/// <param name="detail">When true, prints per-mutation ciphertext previews and all fuzz iterations.<br/></param>
+void RunSymmetricAttackPreset(bool requireIntegrity, bool detail)
+{
+    WriteLineColor(ConsoleColor.Cyan, $"=== Symmetric attack simulations (integrity:{(requireIntegrity ? "on" : "off")}, detail:{(detail ? "on" : "off")}) ===");
+    byte[] deterministicSeed = new byte[]
+    {
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
+        0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65, 0x43, 0x21
+    };
+    using var key = Zifika.CreateKey(deterministicSeed, keySize: 8);
+
+    var payloads = BuildAttackPayloads();
+    var vectors = new List<(string Label, byte[] Plain, byte[] Cipher)>(payloads.Count);
+    foreach (var (label, plain) in payloads)
+    {
+        using var ct = Zifika.Encrypt(plain, key, useIntegrity: requireIntegrity);
+        vectors.Add((label, plain, ct.ToArray()));
+    }
+
+    int totalCases = 0;
+    int blockedOrGarbledCases = 0;
+    byte[] appendGarbage = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22, 0x33, 0x44 };
+
+    for (int i = 0; i < vectors.Count; i++)
+    {
+        var current = vectors[i];
+        var peer = vectors[(i + 1) % vectors.Count];
+        lastSymPlainHex = Convert.ToHexString(current.Plain);
+        lastSymCipherHex = Convert.ToHexString(current.Cipher);
+
+        void RunCase(string attackName, byte[] tampered)
+        {
+            totalCases++;
+            bool blocked = IsSymmetricBlockedOrGarbled(tampered, current.Plain, key, requireIntegrity, out string outcome);
+            if (blocked) blockedOrGarbledCases++;
+            PrintAttackLine("sym", current.Label, attackName, blocked, outcome, detail, tampered);
+        }
+
+        RunCase("flip-byte-0", MutateFlipByte(current.Cipher, 0));
+        RunCase("flip-byte-4", MutateFlipByte(current.Cipher, 4));
+        RunCase("flip-byte-middle", MutateFlipByte(current.Cipher, current.Cipher.Length / 2, 0x04));
+        RunCase("flip-byte-tail", MutateFlipByte(current.Cipher, current.Cipher.Length - 1, 0x80));
+        RunCase("truncate-minus-1", MutateTruncate(current.Cipher, 1));
+        RunCase("truncate-minus-8", MutateTruncate(current.Cipher, 8));
+        RunCase("append-garbage-8", MutateAppend(current.Cipher, appendGarbage));
+        RunCase("splice-half-with-peer", MutateSpliceHalf(current.Cipher, peer.Cipher));
+
+        totalCases++;
+        Span<byte> wrongSeed = stackalloc byte[16];
+        int wrongSeedBase = StableSeedFromLabel("sym-wrong-key-" + current.Label);
+        BinaryPrimitives.WriteInt32LittleEndian(wrongSeed.Slice(0, 4), wrongSeedBase);
+        BinaryPrimitives.WriteInt32LittleEndian(wrongSeed.Slice(4, 4), wrongSeedBase ^ 0x13579BDF);
+        BinaryPrimitives.WriteInt32LittleEndian(wrongSeed.Slice(8, 4), wrongSeedBase ^ unchecked((int)0x89ABCDEF));
+        BinaryPrimitives.WriteInt32LittleEndian(wrongSeed.Slice(12, 4), wrongSeedBase ^ 0x2468ACE0);
+        using (var wrongKey = Zifika.CreateKey(wrongSeed, keySize: 8))
+        {
+            bool blocked = IsSymmetricBlockedOrGarbled(current.Cipher, current.Plain, wrongKey, requireIntegrity, out string outcome);
+            if (blocked) blockedOrGarbledCases++;
+            PrintAttackLine("sym", current.Label, "wrong-key", blocked, outcome, detail, current.Cipher);
+        }
+
+        const int fuzzCount = 64;
+        int fuzzBlocked = 0;
+        var rng = new Random(StableSeedFromLabel("sym-fuzz-" + current.Label) ^ current.Cipher.Length);
+        for (int f = 0; f < fuzzCount; f++)
+        {
+            totalCases++;
+            int idx = current.Cipher.Length == 0 ? 0 : rng.Next(current.Cipher.Length);
+            int bit = rng.Next(8);
+            byte mask = (byte)(1 << bit);
+            var tampered = MutateFlipByte(current.Cipher, idx, mask);
+            bool blocked = IsSymmetricBlockedOrGarbled(tampered, current.Plain, key, requireIntegrity, out string outcome);
+            if (blocked)
+            {
+                blockedOrGarbledCases++;
+                fuzzBlocked++;
+            }
+            if (detail || !blocked)
+                PrintAttackLine("sym", current.Label, $"fuzz-{f + 1:D2}@{idx}/0x{mask:X2}", blocked, outcome, detail, tampered);
+        }
+
+        if (!detail)
+            WriteLineColor(ConsoleColor.Red, $"[sym-attack][{current.Label}] fuzz-summary: blocked-or-garbled={fuzzBlocked}/{fuzzCount}");
+    }
+
+    WriteLineColor(ConsoleColor.Red, $"[sym-attack] overall blocked-or-garbled={blockedOrGarbledCases}/{totalCases}");
+    Console.WriteLine();
 }
 
 /// <summary>
@@ -2023,6 +2401,91 @@ void RunMintVerifyPreset(ZifikaMintingKey minting, ZifikaVerifierKey vKey, bool 
 }
 
 /// <summary>
+/// Run mint/verify attack simulations and report whether tampering is blocked or garbles output.<br/>
+/// Uses one minting/verifier pair plus a second verifier for wrong-key checks.<br/>
+/// </summary>
+/// <param name="requireIntegrity">Integrity requirement used during verify/decrypt attempts.<br/></param>
+/// <param name="detail">When true, prints per-mutation ciphertext previews and all fuzz iterations.<br/></param>
+void RunMintVerifyAttackPreset(bool requireIntegrity, bool detail)
+{
+    WriteLineColor(ConsoleColor.Cyan, $"=== Mint/Verify attack simulations (integrity:{(requireIntegrity ? "on" : "off")}, detail:{(detail ? "on" : "off")}) ===");
+
+    var primaryPair = Zifika.CreateMintingKeyPair();
+    var minting = primaryPair.minting;
+    var verifier = primaryPair.verifier;
+    var wrongPair = Zifika.CreateMintingKeyPair();
+    var wrongVerifier = wrongPair.verifier;
+
+    var payloads = BuildAttackPayloads();
+    var vectors = new List<(string Label, byte[] Plain, byte[] Cipher)>(payloads.Count);
+    foreach (var (label, plain) in payloads)
+    {
+        using var ct = Zifika.Mint(plain, minting, useIntegrity: requireIntegrity);
+        vectors.Add((label, plain, ct.ToArray()));
+    }
+
+    int totalCases = 0;
+    int blockedOrGarbledCases = 0;
+    byte[] appendGarbage = new byte[] { 0x44, 0x33, 0x22, 0x11, 0xA5, 0x5A, 0xC3, 0x3C };
+
+    for (int i = 0; i < vectors.Count; i++)
+    {
+        var current = vectors[i];
+        var peer = vectors[(i + 1) % vectors.Count];
+        lastMintPlainHex = Convert.ToHexString(current.Plain);
+        lastMintCipherHex = Convert.ToHexString(current.Cipher);
+
+        void RunCase(string attackName, byte[] tampered)
+        {
+            totalCases++;
+            bool blocked = IsMintVerifyBlockedOrGarbled(tampered, current.Plain, verifier, requireIntegrity, out string outcome);
+            if (blocked) blockedOrGarbledCases++;
+            PrintAttackLine("m/v", current.Label, attackName, blocked, outcome, detail, tampered);
+        }
+
+        RunCase("flip-vkeylock-byte-0", MutateFlipByte(current.Cipher, 0));
+        RunCase("flip-control-byte-20", MutateFlipByte(current.Cipher, 20));
+        RunCase("flip-byte-middle", MutateFlipByte(current.Cipher, current.Cipher.Length / 2, 0x08));
+        RunCase("flip-byte-tail", MutateFlipByte(current.Cipher, current.Cipher.Length - 1, 0x40));
+        RunCase("truncate-minus-1", MutateTruncate(current.Cipher, 1));
+        RunCase("truncate-minus-16", MutateTruncate(current.Cipher, 16));
+        RunCase("append-garbage-8", MutateAppend(current.Cipher, appendGarbage));
+        RunCase("splice-half-with-peer", MutateSpliceHalf(current.Cipher, peer.Cipher));
+
+        totalCases++;
+        bool wrongVerifierBlocked = IsMintVerifyBlockedOrGarbled(current.Cipher, current.Plain, wrongVerifier, requireIntegrity, out string wrongVerifierOutcome);
+        if (wrongVerifierBlocked) blockedOrGarbledCases++;
+        PrintAttackLine("m/v", current.Label, "wrong-verifier-key", wrongVerifierBlocked, wrongVerifierOutcome, detail, current.Cipher);
+
+        const int fuzzCount = 64;
+        int fuzzBlocked = 0;
+        var rng = new Random(StableSeedFromLabel("mv-fuzz-" + current.Label) ^ current.Cipher.Length);
+        for (int f = 0; f < fuzzCount; f++)
+        {
+            totalCases++;
+            int idx = current.Cipher.Length == 0 ? 0 : rng.Next(current.Cipher.Length);
+            int bit = rng.Next(8);
+            byte mask = (byte)(1 << bit);
+            var tampered = MutateFlipByte(current.Cipher, idx, mask);
+            bool blocked = IsMintVerifyBlockedOrGarbled(tampered, current.Plain, verifier, requireIntegrity, out string outcome);
+            if (blocked)
+            {
+                blockedOrGarbledCases++;
+                fuzzBlocked++;
+            }
+            if (detail || !blocked)
+                PrintAttackLine("m/v", current.Label, $"fuzz-{f + 1:D2}@{idx}/0x{mask:X2}", blocked, outcome, detail, tampered);
+        }
+
+        if (!detail)
+            WriteLineColor(ConsoleColor.Red, $"[m/v-attack][{current.Label}] fuzz-summary: blocked-or-garbled={fuzzBlocked}/{fuzzCount}");
+    }
+
+    WriteLineColor(ConsoleColor.Red, $"[m/v-attack] overall blocked-or-garbled={blockedOrGarbledCases}/{totalCases}");
+    Console.WriteLine();
+}
+
+/// <summary>
 /// Interactive Mint/Verify mint (encrypt) with the current minting key; prints blobs and overhead.<br/>
 /// </summary>
 void MintInteractive(ZifikaMintingKey minting, ZifikaVerifierKey vKey, bool useIntegrity)
@@ -2182,6 +2645,57 @@ void RunMintVerifyMenu()
 }
 
 /// <summary>
+/// Dedicated attack simulation menu for critics/reviewers to exercise tamper scenarios in both modes.<br/>
+/// Keeps attack demos separate from normal happy-path demos and exposes a detail toggle for verbosity control.<br/>
+/// </summary>
+void RunAttackSimulationMenu()
+{
+    breadcrumb = new List<string> { "Main", "Attack Simulations" };
+    bool symmetricRequireIntegrity = true;
+    bool mintVerifyRequireIntegrity = true;
+
+    while (true)
+    {
+        Console.WriteLine();
+        PrintBreadcrumb();
+        WriteLineColor(ConsoleColor.Cyan, "Attack simulations menu:");
+        Console.WriteLine($"  A) Run symmetric attack simulations (integrity:{(symmetricRequireIntegrity ? "on" : "off")})");
+        Console.WriteLine($"  B) Run mint/verify attack simulations (integrity:{(mintVerifyRequireIntegrity ? "on" : "off")})");
+        Console.WriteLine("  C) Toggle symmetric integrity requirement");
+        Console.WriteLine("  D) Toggle mint/verify integrity requirement");
+        Console.WriteLine($"  E) Toggle detail output (currently:{(attackSimulationDetail ? "on" : "off")})");
+        Console.WriteLine("  X) Back (ESC)");
+        var choice = ReadChoiceKey("Select (A/B/C/D/E/X or ESC): ", "A", "B", "C", "D", "E", "X");
+        if (choice == "ESC" || string.Equals(choice, "X", StringComparison.OrdinalIgnoreCase)) return;
+        if (string.Equals(choice, "C", StringComparison.OrdinalIgnoreCase))
+        {
+            symmetricRequireIntegrity = !symmetricRequireIntegrity;
+            continue;
+        }
+        if (string.Equals(choice, "D", StringComparison.OrdinalIgnoreCase))
+        {
+            mintVerifyRequireIntegrity = !mintVerifyRequireIntegrity;
+            continue;
+        }
+        if (string.Equals(choice, "E", StringComparison.OrdinalIgnoreCase))
+        {
+            attackSimulationDetail = !attackSimulationDetail;
+            continue;
+        }
+        if (string.Equals(choice, "A", StringComparison.OrdinalIgnoreCase))
+        {
+            RunSymmetricAttackPreset(symmetricRequireIntegrity, attackSimulationDetail);
+            continue;
+        }
+        if (string.Equals(choice, "B", StringComparison.OrdinalIgnoreCase))
+        {
+            RunMintVerifyAttackPreset(mintVerifyRequireIntegrity, attackSimulationDetail);
+            continue;
+        }
+    }
+}
+
+/// <summary>
 /// Entry menu for the Zifika primer harness; choose symmetric or Mint/Verify flows.<br/>
 /// </summary>
 void RunZifikaPrimer()
@@ -2195,12 +2709,14 @@ void RunZifikaPrimer()
         WriteLineColor(ConsoleColor.Cyan, "Main menu:");
         Console.WriteLine("  S) Symmetric (encrypt/decrypt)");
         Console.WriteLine("  A) Mint/Verify");
+        Console.WriteLine("  T) Attack simulations");
         Console.WriteLine($"  ?) {GlossaryLabel}");
         Console.WriteLine("  X) Exit");
-        var choice = ReadChoiceKey("Select (S/A/?/X or ESC): ", "S", "A", "?", "X");
+        var choice = ReadChoiceKey("Select (S/A/T/?/X or ESC): ", "S", "A", "T", "?", "X");
         if (choice == "ESC" || string.Equals(choice, "X", StringComparison.OrdinalIgnoreCase)) return;
         if (string.Equals(choice, "S", StringComparison.OrdinalIgnoreCase)) RunSymmetricMenu();
         else if (string.Equals(choice, "A", StringComparison.OrdinalIgnoreCase)) RunMintVerifyMenu();
+        else if (string.Equals(choice, "T", StringComparison.OrdinalIgnoreCase)) RunAttackSimulationMenu();
         else if (string.Equals(choice, "?", StringComparison.OrdinalIgnoreCase)) RunGlossaryMenu(GlossaryContextMain);
     }
 }

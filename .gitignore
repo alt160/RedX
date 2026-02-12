@@ -149,6 +149,7 @@ _TeamCity*
 coverage*.json
 coverage*.xml
 coverage*.info
+AGENTS.md
 
 # Visual Studio code coverage results
 *.coverage

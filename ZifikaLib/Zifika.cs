@@ -376,19 +376,20 @@ namespace ZifikaLib
 
             try
             {
-                // 1) random start location (payload walk, 1-bit encoded)
+                // 1) random start location (payload walk, fixed 2-byte little-endian)
                 ushort startLocation = (ushort)RandomNumberGenerator.GetInt32(0, Math.Min(key.key.Length, ushort.MaxValue + 1));
                 short startLocationShort = unchecked((short)startLocation);
 
-                // 2) per-message 4-byte lock to encrypt control stream
-                vKeyLockBytes = RandomNumberGenerator.GetBytes(4);
+                // 2) per-message verifier lock used as control-stream catalyst
+                vKeyLockBytes = RandomNumberGenerator.GetBytes(VerifyingKeyLockSize);
                 ret.Write(vKeyLockBytes);
 
                 // 3) encrypted start location (pos-0 mapping; verifier-key-bound when available)
-                startBuf = startLocation.To1BitEncodedBytes(randomizeUnusedBits: true);
+                startBuf = new byte[2];
+                BinaryPrimitives.WriteUInt16LittleEndian(startBuf, startLocation);
                 if (vKeyTarget != null)
                 {
-                    using var startEnc = key.MapData(vKeyTarget, vKeyLockBytes, startBuf, 0);
+                    using var startEnc = key.MapData(vKeyTarget, vKeyLockBytes, startBuf, 0, vKeyLockBytes);
                     ret.Write(startEnc);
                 }
                 else
@@ -403,68 +404,33 @@ namespace ZifikaLib
                 payloadKey = ZifikaKey.RehydrateFromRawKeyBytes(key.key);
                 payloadKey.ReshuffleInPlace(intCat);
 
-                // Strategy: for small/medium payloads use a single accumulator signature; for larger payloads use checkpoints up to maxCheckpoints.
-                const int SingleSigThreshold = 4 * 1024; // switch to checkpoints above this
-                bool useCheckpoints = data.Length > SingleSigThreshold;
-
-                int ckCount, interval;
+                int ckCount;
+                int interval;
                 ReadOnlySpan<byte> rKeyId32 = key.keyHash.Span.Slice(0, 32);
                 byte[] intCatArr = intCat;
 
-                if (useCheckpoints)
+                // single uniform checkpoint strategy for all payload sizes
+                ComputeCheckpointPlan(data.Length, maxCheckpoints, out ckCount, out interval);
+                ckStates = ckCount > 0 ? new byte[ckCount * ObserverStateSize] : Array.Empty<byte>();
+                using (var cipher = payloadKey.MapDataWithObserver(data, startLocationShort, intCatArr, interval, ckCount, ckStates))
                 {
-                    // checkpoint path
-                    ComputeCheckpointPlan(data.Length, maxCheckpoints, out ckCount, out interval);
-                    ckStates = ckCount > 0 ? new byte[ckCount * ObserverStateSize] : Array.Empty<byte>();
-                    using (var cipher = payloadKey.MapDataWithObserver(data, startLocationShort, intCatArr, interval, ckCount, ckStates))
-                    {
-                        cipherBytes = cipher.AsReadOnlySpan.ToArray();
-                    }
-
-                    sigs = ckCount > 0 ? new byte[ckCount * DefaultAuthoritySigSize] : Array.Empty<byte>();
-                    using (var ecdsa = ECDsa.Create())
-                    {
-                        ecdsa.ImportPkcs8PrivateKey(authorityPrivateKeyPkcs8, out _);
-
-                        Span<byte> msg = stackalloc byte[AuthorityDomainBytes.Length + 32 + 4 + ObserverStateSize];
-
-                        for (int i = 0; i < ckCount; i++)
-                        {
-                            var st = ckStates.AsSpan(i * ObserverStateSize, ObserverStateSize);
-                            int msgLen = BuildAuthorityMessage(rKeyId32, i, st, msg);
-
-                            var sigDest = sigs.AsSpan(i * DefaultAuthoritySigSize, DefaultAuthoritySigSize);
-                            if (!ecdsa.TrySignData(msg.Slice(0, msgLen), sigDest, HashAlgorithmName.SHA256,
-                                    DSASignatureFormat.IeeeP1363FixedFieldConcatenation, out int written) || written != DefaultAuthoritySigSize)
-                                throw new CryptographicException("authority signing failed");
-                        }
-                    }
-                    DebugMint($"Mint checkpoints: ckCount={ckCount} interval={interval} cipherLen={cipherBytes.Length} useIntegrity={useIntegrity}");
+                    cipherBytes = cipher.AsReadOnlySpan.ToArray();
                 }
-                else
+
+                sigs = ckCount > 0 ? new byte[ckCount * DefaultAuthoritySigSize] : Array.Empty<byte>();
+                using (var ecdsa = ECDsa.Create())
                 {
-                    // single-accumulator path
-                    ckCount = 1;
-                    interval = data.Length; // force one snapshot at end
-
-                    ckStates = new byte[ObserverStateSize];
-                    using (var cipher = payloadKey.MapDataWithObserver(data, startLocationShort, intCatArr, interval, ckCount, ckStates))
+                    ecdsa.ImportPkcs8PrivateKey(authorityPrivateKeyPkcs8, out _);
+                    Span<byte> msg = stackalloc byte[AuthorityDomainBytes.Length + 32 + 4 + ObserverStateSize];
+                    for (int i = 0; i < ckCount; i++)
                     {
-                        cipherBytes = cipher.AsReadOnlySpan.ToArray();
-                    }
-
-                    sigs = new byte[DefaultAuthoritySigSize];
-                    using (var ecdsa = ECDsa.Create())
-                    {
-                        ecdsa.ImportPkcs8PrivateKey(authorityPrivateKeyPkcs8, out _);
-                        Span<byte> msg = stackalloc byte[AuthorityDomainBytes.Length + 32 + 4 + ObserverStateSize];
-                        int msgLen = BuildAuthorityMessage(rKeyId32, 0, ckStates, msg);
-                        var sigDest = sigs.AsSpan();
+                        var st = ckStates.AsSpan(i * ObserverStateSize, ObserverStateSize);
+                        int msgLen = BuildAuthorityMessage(rKeyId32, i, st, msg);
+                        var sigDest = sigs.AsSpan(i * DefaultAuthoritySigSize, DefaultAuthoritySigSize);
                         if (!ecdsa.TrySignData(msg.Slice(0, msgLen), sigDest, HashAlgorithmName.SHA256,
                                 DSASignatureFormat.IeeeP1363FixedFieldConcatenation, out int written) || written != DefaultAuthoritySigSize)
                             throw new CryptographicException("authority signing failed");
                     }
-                    DebugMint($"Mint single-accumulator: ckCount=1 interval={interval} cipherLen={cipherBytes.Length} useIntegrity={useIntegrity}");
                 }
 
                 // write encrypted checkpoint count and signatures (control stream encrypted under vKeyLockBytes at startLocation=0)
@@ -474,7 +440,7 @@ namespace ZifikaLib
 
                 if (vKeyTarget != null)
                 {
-                    using var cntEnc = key.MapData(vKeyTarget, vKeyLockBytes, cntBuf, 0);
+                    using var cntEnc = key.MapData(vKeyTarget, vKeyLockBytes, cntBuf, 0, vKeyLockBytes);
                     ret.Write(cntEnc);
                 }
                 else
@@ -488,7 +454,7 @@ namespace ZifikaLib
                     var sig = sigs.AsSpan(i * DefaultAuthoritySigSize, DefaultAuthoritySigSize);
                     if (vKeyTarget != null)
                     {
-                        using var sigEnc = key.MapData(vKeyTarget, vKeyLockBytes, sig, 0);
+                        using var sigEnc = key.MapData(vKeyTarget, vKeyLockBytes, sig, 0, vKeyLockBytes);
                         ret.Write(sigEnc);
                     }
                     else
@@ -503,18 +469,32 @@ namespace ZifikaLib
                 intCatLenBuf[0] = intCatLen;
                 if (vKeyTarget != null)
                 {
-                    using var lenEnc = key.MapData(vKeyTarget, vKeyLockBytes, intCatLenBuf, 0);
+                    using var lenEnc = key.MapData(vKeyTarget, vKeyLockBytes, intCatLenBuf, 0, vKeyLockBytes);
                     ret.Write(lenEnc);
-                    // Map the interference catalyst header without catalyst-mixing so verifying-key-side decrypt mirrors the symmetric path.
-                    using var headerEnc = key.MapData(vKeyTarget, vKeyLockBytes, intCat, startLocationShort);
+                    // Map the interference catalyst header with the verifier lock catalyst.
+                    using var headerEnc = key.MapData(vKeyTarget, vKeyLockBytes, intCat, startLocationShort, vKeyLockBytes);
                     ret.Write(headerEnc);
                 }
                 else
                 {
                     using var lenEnc = key.MapData(intCatLenBuf, 0, vKeyLockBytes);
                     ret.Write(lenEnc);
-                    using var headerEnc = key.MapData(intCat, startLocationShort);
+                    using var headerEnc = key.MapData(intCat, startLocationShort, vKeyLockBytes);
                     ret.Write(headerEnc);
+                }
+
+                // write payload row-offset length so integrity framing stays unambiguous without compact control mode
+                Span<byte> cipherLenBuf = stackalloc byte[4];
+                BinaryPrimitives.WriteInt32LittleEndian(cipherLenBuf, cipherBytes.Length);
+                if (vKeyTarget != null)
+                {
+                    using var cipherLenEnc = key.MapData(vKeyTarget, vKeyLockBytes, cipherLenBuf, 0, vKeyLockBytes);
+                    ret.Write(cipherLenEnc);
+                }
+                else
+                {
+                    using var cipherLenEnc = key.MapData(cipherLenBuf, 0, vKeyLockBytes);
+                    ret.Write(cipherLenEnc);
                 }
 
                 // append ciphertext key-row offset stream
@@ -530,12 +510,12 @@ namespace ZifikaLib
                     b3.Finalize(integritySeal);
                     if (vKeyTarget != null)
                     {
-                        using var integrityEnc = payloadKey.MapData(vKeyTarget, vKeyLockBytes, integritySeal, startLocationShort, intCat);
+                        using var integrityEnc = payloadKey.MapData(vKeyTarget, vKeyLockBytes, integritySeal, startLocationShort, vKeyLockBytes);
                         ret.Write(integrityEnc);
                     }
                     else
                     {
-                        using var integrityEnc = payloadKey.MapData(integritySeal, startLocationShort, intCat);
+                        using var integrityEnc = payloadKey.MapData(integritySeal, startLocationShort, vKeyLockBytes);
                         ret.Write(integrityEnc);
                     }
                 }
@@ -619,16 +599,17 @@ namespace ZifikaLib
 
                     curRow = (curRow + rowJump) % keyBlockSize;
                     curCol = (curCol + colJump) % 256;
+                    int landingCol = curCol;
 
                     int dist = key.rkd[curRow][(byte)cipherVal];
-                    int newCol = (curCol + dist) % 256;
+                    int newCol = (landingCol + dist) & 0xFF;
                     byte plain = key.key[curRow * 256 + newCol];
                     if (intCatLen > 0)
                         plain = (byte)((256 + plain - idx - intCat[idx % intCatLen]) % 256);
 
                     buf[idx] = plain;
 
-                    curCol = newCol;
+                    curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                     curRow = (curRow + 1) % keyBlockSize;
 
                     if ((plain & 0x80) == 0)
@@ -651,63 +632,8 @@ namespace ZifikaLib
             }
         }
         /// <summary>
-        /// Read a 1-bit encoded start location from a verifier-key compact header stream.<br/>
-        /// Assumes the compact marker (0xFE) and XOR keystream encoding used by MapData(vKey, ...).<br/>
-        /// Returns false on decode failure, unexpected EOF, or non-canonical encoding.<br/>
-        /// </summary>
-        /// <param name="vKey">Verifier key used to unmask the compact header.<br/></param>
-        /// <param name="ciphertext">Ciphertext stream positioned at the startLocation field.<br/></param>
-        /// <param name="vKeyLock">Verifier key lock bytes for keystream derivation.<br/></param>
-        /// <param name="startLocation">Decoded start location value (ushort range).<br/></param>
-        /// <returns>True on success; false on failure.<br/></returns>
-        private static bool TryReadStartLocation1BitVKeyCompact(ZifikaVerifyingDecryptionKey verifyingKey, ZifikaBufferStream ciphertext, ReadOnlySpan<byte> verifyingKeyLock, out ushort startLocation)
-        {
-            startLocation = 0;
-            if (verifyingKey == null || ciphertext == null) return false;
-            try
-            {
-                int marker = ciphertext.ReadByte();
-                if (marker < 0 || marker != 0xFE) return false;
-
-                const int MaxBytes = 16; // ushort = 16 bits
-                Span<byte> buf = stackalloc byte[MaxBytes];
-                Span<byte> ks = stackalloc byte[1];
-                bool terminated = false;
-                int idx = 0;
-
-                using var xof = new Blake3XofReader(verifyingKey.keyHash.Span, verifyingKeyLock);
-
-                for (; idx < MaxBytes; idx++)
-                {
-                    int enc = ciphertext.ReadByte();
-                    if (enc < 0) return false;
-
-                    xof.ReadNext(ks);
-                    byte plain = (byte)(enc ^ ks[0]);
-                    buf[idx] = plain;
-
-                    if ((plain & 0x80) == 0)
-                    {
-                        terminated = true;
-                        idx++;
-                        break;
-                    }
-                }
-
-                if (!terminated || idx <= 0 || idx > MaxBytes) return false;
-
-                ReadOnlySpan<byte> ro = buf.Slice(0, idx);
-                startLocation = Integer1BitEncodingExtensions.Read1BitEncodedUInt16(ro, out int bytesRead);
-                return bytesRead == idx;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        /// <summary>
         /// Verify + decrypt with mandatory authority verification (mint/verify).<br/>
-        /// Wire layout (mint/verify): vKeyLock | enc(startLocation1Bit) | enc(ckCount) | enc(sigs…) | enc(intCatLen) | enc(intCat) | key-row offset stream | [enc(integritySeal, optional)].<br/>
+        /// Wire layout (mint/verify): vKeyLock16 | enc(startLocationU16LE) | enc(ckCount) | enc(sigs…) | enc(intCatLen) | enc(intCat) | enc(cipherLen) | key-row offset stream | [enc(integritySeal, optional)].<br/>
         /// Integrity seal is computed over key-row offset stream||intCat; when requireIntegrity is true the seal must be present and valid; when false, no seal is expected. Missing/invalid integrity fails decryption (no fallback).<br/>
         /// Checkpoints/signatures are always required for provenance.<br/>
         /// </summary>
@@ -724,34 +650,40 @@ namespace ZifikaLib
                 byte[] rkdFlat = null;
                 byte[] sigs = null;
                 byte[] rowOffsetBytes = null;
-                byte[] integrityEnc = null;
                 ZifikaBufferStream intCat = null;
 
                 try
                 {
-                    verifyingKeyLock = ciphertext.ReadBytes(4);
-                    if (verifyingKeyLock.Length != 4) return null;
-
-                    if (!TryReadStartLocation1BitVKeyCompact(verifyingKey, ciphertext, verifyingKeyLock, out ushort startLocationU16))
+                    verifyingKeyLock = ciphertext.ReadBytes(VerifyingKeyLockSize);
+                    if (verifyingKeyLock.Length != VerifyingKeyLockSize)
                     {
-                        DebugMint("VerifyAndDecrypt(vKey) startLocation decode failed");
+                        DebugMint($"VerifyAndDecrypt(v2) invalid lock length: {verifyingKeyLock.Length}");
                         return null;
                     }
+                    verifyingKey.BuildBaseKeyBytesAndRkd(out keyBytes, out rkdFlat);
+
+                    using var startPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, verifyingKeyLock, 2, false, rkdFlat);
+                    if (startPlain == null || startPlain.Length != 2)
+                    {
+                        DebugMint("VerifyAndDecrypt(v2) startPlain decode failed");
+                        return null;
+                    }
+                    ushort startLocationU16 = BinaryPrimitives.ReadUInt16LittleEndian(startPlain.AsReadOnlySpan);
+                    startPlain.ClearBuffer();
                     var startLocation = unchecked((short)startLocationU16);
 
                     // read encrypted checkpoint count
-                    verifyingKey.BuildBaseKeyBytesAndRkd(out keyBytes, out rkdFlat);
-                    using var cntPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, default, 4, false, rkdFlat);
+                    using var cntPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, verifyingKeyLock, 4, false, rkdFlat);
                     if (cntPlain == null || cntPlain.Length != 4)
                     {
-                        DebugMint("VerifyAndDecrypt(vKey) cntPlain null/len!=4");
+                        DebugMint("VerifyAndDecrypt(v2) ckCount decode failed");
                         return null;
                     }
                     int ckCount = BinaryPrimitives.ReadInt32LittleEndian(cntPlain.AsReadOnlySpan);
                     cntPlain.ClearBuffer();
                     if (ckCount < 0 || ckCount > maxCheckpoints)
                     {
-                        DebugMint($"VerifyAndDecrypt(vKey) ckCount out of range: {ckCount}");
+                        DebugMint($"VerifyAndDecrypt(v2) ckCount out of range: {ckCount}");
                         return null;
                     }
 
@@ -759,46 +691,67 @@ namespace ZifikaLib
                     sigs = ckCount > 0 ? new byte[ckCount * DefaultAuthoritySigSize] : Array.Empty<byte>();
                     for (int i = 0; i < ckCount; i++)
                     {
-                        using var sigPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, default, DefaultAuthoritySigSize, false, rkdFlat);
+                        using var sigPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, verifyingKeyLock, DefaultAuthoritySigSize, false, rkdFlat);
                         if (sigPlain == null || sigPlain.Length != DefaultAuthoritySigSize)
                         {
-                            DebugMint($"VerifyAndDecrypt(vKey) sig[{i}] null/len!=64");
+                            DebugMint($"VerifyAndDecrypt(v2) sig[{i}] decode failed");
                             return null;
                         }
                         sigPlain.AsReadOnlySpan.CopyTo(sigs.AsSpan(i * DefaultAuthoritySigSize, DefaultAuthoritySigSize));
                         sigPlain.ClearBuffer();
                     }
 
-                    // intCat header (reject compact)
-                    using var intCatLenPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, default, 1, false, rkdFlat);
-                    if (intCatLenPlain == null || intCatLenPlain.Length != 1) return null;
+                    // intCat header
+                    using var intCatLenPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, verifyingKeyLock, 1, false, rkdFlat);
+                    if (intCatLenPlain == null || intCatLenPlain.Length != 1)
+                    {
+                        DebugMint("VerifyAndDecrypt(v2) intCatLen decode failed");
+                        return null;
+                    }
                     var intCatLen = intCatLenPlain.AsReadOnlySpan[0];
                     intCatLenPlain.ClearBuffer();
-                    intCat = verifyingKey.UnmapDataWithRkd(ciphertext, startLocation, verifyingKeyLock, default, intCatLen, false, rkdFlat);
+                    if (intCatLen < 7 || intCatLen >= 64)
+                    {
+                        DebugMint($"VerifyAndDecrypt(v2) intCatLen out of range: {intCatLen}");
+                        return null;
+                    }
+                    intCat = verifyingKey.UnmapDataWithRkd(ciphertext, startLocation, verifyingKeyLock, verifyingKeyLock, intCatLen, false, rkdFlat);
                     if (intCat == null || intCat.Length != intCatLen)
+                    {
+                        DebugMint("VerifyAndDecrypt(v2) intCat decode failed");
                         throw new InvalidDataException("Interference catalyst header decode failed (verifier path).");
+                    }
+
+                    using var cipherLenPlain = verifyingKey.UnmapDataWithRkd(ciphertext, 0, verifyingKeyLock, verifyingKeyLock, 4, false, rkdFlat);
+                    if (cipherLenPlain == null || cipherLenPlain.Length != 4)
+                    {
+                        DebugMint("VerifyAndDecrypt(v2) cipherLen decode failed");
+                        return null;
+                    }
+                    int cipherLen = BinaryPrimitives.ReadInt32LittleEndian(cipherLenPlain.AsReadOnlySpan);
+                    cipherLenPlain.ClearBuffer();
+                    if (cipherLen < 0)
+                    {
+                        DebugMint($"VerifyAndDecrypt(v2) cipherLen negative: {cipherLen}");
+                        return null;
+                    }
 
                     ZifikaVerifyingDecryptionKey.ReshuffleKeyBytesAndRkdInPlace(keyBytes, rkdFlat, intCat.AsReadOnlySpan);
 
                     int remaining = (int)(ciphertext.Length - ciphertext.Position);
-                    // Integrity seal is verifier-key mapped; compact encoding adds a 1-byte marker.
-                    int integrityEncodedLen = requireIntegrity ? 33 : 0; // MapData(vKey, ...) uses compact path for 32-byte integrity seal
-                    if (remaining < integrityEncodedLen) return null;
-                    int cipherLen = remaining - integrityEncodedLen;
+                    if (remaining < cipherLen)
+                    {
+                        DebugMint($"VerifyAndDecrypt(v2) remaining<{nameof(cipherLen)} remaining={remaining} cipherLen={cipherLen}");
+                        return null;
+                    }
                     rowOffsetBytes = ciphertext.ReadBytes(cipherLen);
-                    integrityEnc = requireIntegrity ? ciphertext.ReadBytes(integrityEncodedLen) : Array.Empty<byte>();
 
                     if (requireIntegrity)
                     {
-                        if (integrityEnc.Length != integrityEncodedLen)
-                        {
-                            DebugMint($"VerifyAndDecrypt(vKey) integrityEnc length mismatch (got {integrityEnc.Length}, want {integrityEncodedLen})");
-                            return null;
-                        }
-                        using var integrityPlain = verifyingKey.UnmapDataWithRkd(new ZifikaBufferStream(integrityEnc), startLocation, verifyingKeyLock, intCat.AsReadOnlySpan, 32, false, rkdFlat);
+                        using var integrityPlain = verifyingKey.UnmapDataWithRkd(ciphertext, startLocation, verifyingKeyLock, verifyingKeyLock, 32, false, rkdFlat, keyBytes);
                         if (integrityPlain == null || integrityPlain.Length != 32)
                         {
-                            DebugMint("VerifyAndDecrypt(vKey) integrityPlain null/len!=32");
+                            DebugMint("VerifyAndDecrypt(v2) integrity decode failed");
                             return null;
                         }
                         var b3 = Blake3.Hasher.New();
@@ -808,25 +761,24 @@ namespace ZifikaLib
                         b3.Finalize(integrity2);
                         if (!integrityPlain.AsReadOnlySpan.SequenceEqual(integrity2))
                         {
-                            DebugMint("VerifyAndDecrypt(vKey) integrity seal mismatch");
+                            DebugMint("VerifyAndDecrypt(v2) integrity mismatch");
                             return null;
                         }
                         integrityPlain.ClearBuffer();
                     }
+                    if (ciphertext.Position != ciphertext.Length)
+                    {
+                        DebugMint($"VerifyAndDecrypt(v2) trailing bytes remain: {ciphertext.Length - ciphertext.Position}");
+                        return null;
+                    }
 
                     // derive checkpoint plan based on jump length
                     ComputeCheckpointPlan(cipherLen, maxCheckpoints, out int planCount, out int interval);
-                    if (ckCount == 1 && planCount != 1)
+                    if (planCount != ckCount)
                     {
-                        // Encryption used single-accumulator path; force interval to full length
-                        interval = cipherLen;
-                    }
-                    else if (planCount != ckCount)
-                    {
-                        DebugMint($"VerifyAndDecrypt(vKey) plan mismatch planCount={planCount} ckCount={ckCount}");
+                        DebugMint($"VerifyAndDecrypt(v2) checkpoint plan mismatch plan={planCount} ckCount={ckCount}");
                         return null;
                     }
-                    DebugMint($"VerifyAndDecrypt(vKey) start={startLocationU16} ckCount={ckCount} interval={interval} cipherLen={cipherLen} intCatLen={intCatLen} requireIntegrity={requireIntegrity}");
 
                     ReadOnlySpan<byte> rKeyId32 = verifyingKey.keyHash.Span.Slice(0, 32);
 
@@ -836,14 +788,21 @@ namespace ZifikaLib
                         ecdsa.ImportSubjectPublicKeyInfo(authorityPublicKeySpki, out _);
                         using var verifyOnly = verifyingKey.UnmapDataWithAuthorityWithRkd(new ZifikaBufferStream(rowOffsetBytes), startLocation, intCat.AsReadOnlySpan, interval, ckCount, sigs, ecdsa, rKeyId32, keyBytes, rkdFlat, count: cipherLen);
                         if (verifyOnly == null)
+                        {
+                            DebugMint("VerifyAndDecrypt(v2) verify pass failed");
                             return null;
+                        }
                         verifyOnly.ClearBuffer();
                     }
 
                     using var ecdsa2 = ECDsa.Create();
                     ecdsa2.ImportSubjectPublicKeyInfo(authorityPublicKeySpki, out _);
                     var plain = verifyingKey.UnmapDataWithAuthorityWithRkd(new ZifikaBufferStream(rowOffsetBytes), startLocation, intCat.AsReadOnlySpan, interval, ckCount, sigs, ecdsa2, rKeyId32, keyBytes, rkdFlat, count: cipherLen);
-                    if (plain == null) return null;
+                    if (plain == null)
+                    {
+                        DebugMint("VerifyAndDecrypt(v2) final decrypt pass failed");
+                        return null;
+                    }
                     plain.Position = 0;
                     return plain;
                 }
@@ -858,8 +817,6 @@ namespace ZifikaLib
                         Array.Clear(sigs, 0, sigs.Length);
                     if (rowOffsetBytes != null && rowOffsetBytes.Length > 0)
                         Array.Clear(rowOffsetBytes, 0, rowOffsetBytes.Length);
-                    if (integrityEnc != null && integrityEnc.Length > 0)
-                        Array.Clear(integrityEnc, 0, integrityEnc.Length);
                     if (verifyingKeyLock != null && verifyingKeyLock.Length > 0)
                         Array.Clear(verifyingKeyLock, 0, verifyingKeyLock.Length);
                     if (keyBytes != null)
@@ -868,8 +825,9 @@ namespace ZifikaLib
                         Array.Clear(rkdFlat, 0, rkdFlat.Length);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                DebugMint($"VerifyAndDecrypt(v2) threw {ex.GetType().Name}: {ex.Message}");
                 return null;
             }
         }
@@ -893,6 +851,7 @@ namespace ZifikaLib
         // Lightweight toggle for temporary mint/verify tracing; set false to silence.
         //======  FIELDS  ======
         internal const bool DebugMintVerify = true;
+        internal const int VerifyingKeyLockSize = 16;
         // Default cap on embedded checkpoint signatures (mint/verify mode)
         internal const int DefaultAuthorityCheckpointMax = 64;
         // Default fixed signature size for P-256 ECDSA in IEEE-P1363 fixed format.
@@ -1213,55 +1172,31 @@ namespace ZifikaLib
 
         /// <summary>
         /// Map data for a specific verifier key target by encoding per-position nonces alongside the key-row offset stream.<br/>
-        /// Small payloads use a compact XOR-with-XOF fast path; larger payloads choose between dictionary and RLE nonce encodings for efficiency.<br/>
-        /// This keeps the control stream decryptable by the verifier key without leaking the full permutation.
+        /// Uses dictionary or RLE nonce encodings to keep the control stream decryptable by the verifier key without leaking the full permutation.<br/>
+        /// The verifier lock is expected to be a fixed-size 16-byte control catalyst in mint/verify v2.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal ZifikaBufferStream MapData(ZifikaVerifyingDecryptionKey verifyingKey, ReadOnlySpan<byte> verifyingKeyLock, ReadOnlySpan<byte> data, short startLocation, Span<byte> intCat = default)
         {
             EnsureNotDisposed();
+            if (verifyingKey == null) throw new ArgumentNullException(nameof(verifyingKey));
+            if (verifyingKeyLock.Length != Zifika.VerifyingKeyLockSize)
+                throw new ArgumentException($"verifyingKeyLock must be {Zifika.VerifyingKeyLockSize} bytes", nameof(verifyingKeyLock));
             // normalize startLocation (treat as ushort for full range)
             int start = ((ushort)startLocation) % keyLength;
             int curRow = (start / 256) % keyBlockSize;
             int curCol = (start % 256);
             int intCatLen = intCat.Length;
 
-            // Compact encoding threshold: if payload is small we use a compact
-            // vKey-encoded mode to avoid the nonce-dictionary overhead.
-            const int CompactThreshold = 128; // bytes
-            const byte CompactMarker = 0xFE;
-
-            // Small-blob fast path: write marker + XOR-keystream of payload derived
-            // from (vKey.keyHash || vKeyLock). This keeps the proof plaintext encrypted
-            // under the verifier key without building large nonce tables.
-            if (data.Length > 0 && data.Length <= CompactThreshold)
-            {
-                var outBs = new ZifikaBufferStream();
-                outBs.WriteByte(CompactMarker);
-                // Derive keystream via Blake3 XOF(master=verifyingKey.keyHash, context=verifyingKeyLock)
-                var keystream = new byte[data.Length];
-                using (var xof = new Blake3XofReader(verifyingKey.keyHash.Span, verifyingKeyLock))
-                {
-                    xof.ReadNext(keystream);
-                }
-                Span<byte> enc = stackalloc byte[0]; // placeholder to avoid analyzer warnings
-                var tmp = new byte[data.Length];
-                for (int i = 0; i < data.Length; i++) tmp[i] = (byte)(data[i] ^ keystream[i]);
-                outBs.Write(tmp);
-                outBs.Position = 0;
-                return outBs;
-            }
-
             // 1) core encrypt: build key-row offset stream + noncesOut[] + unique-nonce map
             var cipher = new ZifikaBufferStream();
             ushort[] noncesOut = new ushort[data.Length];
 
-            // track unique nonces and assign each a small byte‐index
-            var uniqMap = new Dictionary<ushort, byte>(capacity: 16);
-            byte nextIdx = 0;
+            // track unique nonces by stable insertion index for deterministic table emission
+            var uniqMap = new Dictionary<ushort, int>(capacity: 16);
+            var uniqList = new List<ushort>(capacity: 16);
 
             var bx = new JumpGenerator(verifyingKey.keyHash.Span, 1, intCat);
-            var vKeyXof = new JumpGenerator(verifyingKeyLock, 1);
 
             for (int i = 0; i < data.Length; i++)
             {
@@ -1275,10 +1210,11 @@ namespace ZifikaLib
                 int colJump = j & 0xFF;
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) & 0xFF;
+                int landingCol = curCol;
 
                 // map plaintext→column
                 int newCol = rkd[curRow][cur];
-                int dist = newCol - curCol; if (dist < 0) dist += 256;
+                int dist = newCol - landingCol; if (dist < 0) dist += 256;
                 byte cipherByte = key[curRow * 256 + dist];
                 cipher.WriteByte(cipherByte);
 
@@ -1289,10 +1225,13 @@ namespace ZifikaLib
 
                 // track unique
                 if (!uniqMap.ContainsKey(thisNonce))
-                    uniqMap[thisNonce] = nextIdx++;
+                {
+                    uniqMap[thisNonce] = uniqList.Count;
+                    uniqList.Add(thisNonce);
+                }
 
                 // advance
-                curCol = newCol;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
             }
             cipher.Position = 0;
@@ -1300,12 +1239,13 @@ namespace ZifikaLib
             // 2) compute candidate sizes
 
             // A) dictionary‐encode size
-            int uniqueCount = uniqMap.Count;           // ≤ 256
-            int dictSize = 1       // marker
-                             + 1      // count byte
-                             + uniqueCount * 2  // each unique nonce as ushort
-                             + data.Length      // 1 byte per nonce reference
-                             ;
+            int uniqueCount = uniqList.Count;
+            int dictSize = uniqueCount <= byte.MaxValue
+                ? 1                // marker
+                  + 1              // count byte
+                  + uniqueCount * 2// each unique nonce as ushort
+                  + data.Length    // 1 byte per nonce reference
+                : int.MaxValue;    // dict format cannot encode >255 unique entries
 
             // B) RLE‐encode size (just count, don’t build)
             int rleSize = 1; // marker
@@ -1345,12 +1285,12 @@ namespace ZifikaLib
                 ret.WriteByte(0x01);
                 // count
                 ret.WriteByte((byte)uniqueCount);
-                // dump unique table
-                foreach (var kv in uniqMap)
-                    ret.Write(kv.Key);
+                // dump unique table in explicit index order to keep idx->nonce stable
+                for (int u = 0; u < uniqueCount; u++)
+                    ret.Write(uniqList[u]);
                 // dump each nonce as index
                 for (int i = 0; i < noncesOut.Length; i++)
-                    ret.WriteByte(uniqMap[noncesOut[i]]);
+                    ret.WriteByte((byte)uniqMap[noncesOut[i]]);
             }
             else
             {
@@ -1439,12 +1379,13 @@ namespace ZifikaLib
 
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) % 256;
+                int landingCol = curCol;
 
                 // 🔁 Step 2: Get position of curByte in new row
                 int col = rkd[curRow][curByte];
 
                 // 🔁 Step 3: Calculate wrapped forward distance
-                int dist = col - curCol;
+                int dist = col - landingCol;
                 if (dist < 0)
                     dist += 256;
 
@@ -1452,7 +1393,7 @@ namespace ZifikaLib
                 output.WriteByte(cipherByte);
 
                 // 🔁 Step 4: Advance cursor
-                curCol = col;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
             }
 
@@ -1507,9 +1448,10 @@ namespace ZifikaLib
 
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) % 256;
+                int landingCol = curCol;
 
                 // landing byte (temporal internal state)
-                byte landing = key[curRow * 256 + curCol];
+                byte landing = key[curRow * 256 + landingCol];
                 int mixIdx = (int)(step & 31);
                 obsState[mixIdx] ^= landing;
                 obsState[(mixIdx + 11) & 31] ^= (byte)jump;
@@ -1520,7 +1462,7 @@ namespace ZifikaLib
                 // map plaintext to column
                 int col = rkd[curRow][curByte];
 
-                int dist = col - curCol;
+                int dist = col - landingCol;
                 if (dist < 0) dist += 256;
 
                 // bind authority observer state to ciphertext encoding (distance/new column)
@@ -1530,7 +1472,7 @@ namespace ZifikaLib
                 byte cipherByte = key[curRow * 256 + dist];
                 output.WriteByte(cipherByte);
 
-                curCol = col;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
 
                 // snapshot observer state at checkpoints (after processing this step)
@@ -1615,15 +1557,16 @@ namespace ZifikaLib
 
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) % 256;
+                int landingCol = curCol;
 
                 int dist = rkd[curRow][(byte)cipherVal];
-                int newCol = (curCol + dist) % 256;
+                int newCol = (landingCol + dist) & 0xFF;
                 byte plain = key[curRow * 256 + newCol];
 
                 if (intCatLen > 0)
                     plain = (byte)((256 + plain - i - intCat[i % intCatLen]) % 256);
 
-                curCol = newCol;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
 
                 output.WriteByte(plain);
@@ -1685,9 +1628,10 @@ namespace ZifikaLib
 
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) % 256;
+                int landingCol = curCol;
 
                 // landing byte (temporal internal state)
-                byte landing = key[curRow * 256 + curCol];
+                byte landing = key[curRow * 256 + landingCol];
                 int mixIdx = (int)(step & 31);
                 obsState[mixIdx] ^= landing;
                 obsState[(mixIdx + 11) & 31] ^= (byte)jump;
@@ -1696,7 +1640,7 @@ namespace ZifikaLib
                 step++;
 
                 int dist = rkd[curRow][(byte)cipherVal];
-                int newCol = (curCol + dist) % 256;
+                int newCol = (landingCol + dist) & 0xFF;
                 byte plain = key[curRow * 256 + newCol];
                 // bind authority state to the distance encoding and resulting column
                 obsState[(mixIdx + 5) & 31] ^= (byte)dist;
@@ -1705,7 +1649,7 @@ namespace ZifikaLib
                 if (intCatLen > 0)
                     plain = (byte)((256 + plain - i - intCat[i % intCatLen]) % 256);
 
-                curCol = newCol;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
 
                 output.WriteByte(plain);
@@ -2117,6 +2061,7 @@ namespace ZifikaLib
 
         //======  FIELDS  ======
         private const byte VerifyingKeyVersionCompact = 2; // compact seed+key format (current)
+        private static readonly byte[] VerifierSeedDomainBytes = "Zifika_VKEY_SEED_V1"u8.ToArray();
 
 
 
@@ -2168,8 +2113,14 @@ namespace ZifikaLib
                 b3.Finalize(keyHash.Span);
             }
 
-            // 2) choose seed and derive deterministic per-index nonces
-            seed = RandomNumberGenerator.GetBytes(16);
+            // 2) derive a deterministic verifier seed from full-key material
+            seed = new byte[16];
+            {
+                var seedHasher = Blake3.Hasher.New();
+                seedHasher.Update(VerifierSeedDomainBytes);
+                seedHasher.Update(keyHash.Span);
+                seedHasher.Finalize(seed);
+            }
             compactSeeded = true;
             nonces = new ushort[keyLength];
             chMap = new Dictionary<uint, byte>(keyLength);
@@ -2266,12 +2217,14 @@ namespace ZifikaLib
         // decryption
         /// <summary>
         /// Replay a key-row offset stream into plaintext using the verifier key.
-        /// Supports compact or header-based nonce encodings for small control streams, and interference catalyst mixing to resist replay.<br/>
-        /// Returns a new ZifikaBufferStream positioned at 0 or null on header rejection when rejectCompactHeader is true.
+        /// Supports header-based nonce encodings for control streams and interference catalyst mixing to resist replay.<br/>
+        /// Returns a new ZifikaBufferStream positioned at 0 or null on malformed header/input.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ZifikaBufferStream UnmapData(ZifikaBufferStream mapped, short startLocation, ReadOnlySpan<byte> verifyingKeyLock, ReadOnlySpan<byte> intCat = default, int count = -1, bool rejectCompactHeader = false)
         {
+            if (verifyingKeyLock.Length != Zifika.VerifyingKeyLockSize)
+                throw new ArgumentException($"verifyingKeyLock must be {Zifika.VerifyingKeyLockSize} bytes", nameof(verifyingKeyLock));
             // keyLength is keyBlockSize * 256
             int start = ((ushort)startLocation) % this.keyLength;
             int curRow = start / 256;
@@ -2283,68 +2236,43 @@ namespace ZifikaLib
             var bx = new JumpGenerator(keyHash.Span, 1, intCat);
             var streamLength = mapped.Length;
             var streamPos = mapped.Position;
-            // If a nonce map header was written (dictionary, RLE), or a compact
-            // marker, decode it when the caller provided an explicit count. The
-            // MapData(vKey, ...) encoding writes either a compact marker+payload
-            // or a dictionary/RLE header. We only attempt to decode when count>0.
+            // If a nonce map header was written (dictionary or RLE), decode it
+            // when the caller provided an explicit count.
             if (count > 0)
             {
-                // peek marker
                 int marker = mapped.ReadByte();
-                if (marker >= 0)
+                if (marker == 0x01)
                 {
-                    const byte CompactMarker = 0xFE;
-                    if (marker == CompactMarker)
+                    int uniqueCount = mapped.ReadByte();
+                    for (int u = 0; u < uniqueCount; u++)
+                        mapped.ReadUInt16();
+                    for (int i = 0; i < count; i++)
+                        mapped.ReadByte();
+                }
+                else if (marker == 0x00)
+                {
+                    int p = 0;
+                    while (p < count)
                     {
-                        if (rejectCompactHeader)
-                            return null;
-                        // compact mode: remaining "count" bytes are the XOR'd payload
-                        var buf = new byte[count];
-                        for (int i = 0; i < count; i++) buf[i] = (byte)mapped.ReadByte();
-                        // derive keystream and unmask into a ZifikaBufferStream to return
-                        var ks = new byte[count];
-                        using (var xof = new Blake3XofReader(keyHash.Span, verifyingKeyLock))
+                        int hdr = mapped.ReadByte();
+                        bool isRepeat = (hdr & 0x80) != 0;
+                        int len = hdr & 0x7F;
+                        if (isRepeat)
                         {
-                            xof.ReadNext(ks);
-                        }
-                        var outBuf = new byte[count];
-                        for (int i = 0; i < count; i++) outBuf[i] = (byte)(buf[i] ^ ks[i]);
-                        return new ZifikaBufferStream(outBuf);
-                    }
-                    if (marker == 0x01)
-                    {
-                        int uniqueCount = mapped.ReadByte();
-                        for (int u = 0; u < uniqueCount; u++)
                             mapped.ReadUInt16();
-                        for (int i = 0; i < count; i++)
-                            mapped.ReadByte();
-                    }
-                    else if (marker == 0x00)
-                    {
-                        int p = 0;
-                        while (p < count)
+                            p += len;
+                        }
+                        else
                         {
-                            int hdr = mapped.ReadByte();
-                            bool isRepeat = (hdr & 0x80) != 0;
-                            int len = hdr & 0x7F;
-                            if (isRepeat)
-                            {
+                            for (int k = 0; k < len; k++)
                                 mapped.ReadUInt16();
-                                p += len;
-                            }
-                            else
-                            {
-                                for (int k = 0; k < len; k++)
-                                    mapped.ReadUInt16();
-                                p += len;
-                            }
+                            p += len;
                         }
                     }
-                    else
-                    {
-                        // not a header: rewind one byte and treat as no header
-                        mapped.Position -= 1;
-                    }
+                }
+                else
+                {
+                    return null;
                 }
                 streamLength = mapped.Length;
                 streamPos = mapped.Position;
@@ -2368,11 +2296,12 @@ namespace ZifikaLib
 
                     curRow = (curRow + rowJ) % blockSz;
                     curCol = (curCol + colJ) & 0xFF;
+                    int landingCol = curCol;
 
                     // recover index
                     int rowBase = curRow * 256;
                     int dist = rkdFlat[rowBase + (byte)cipherVal];
-                    int newCol = (curCol + dist) & 0xFF;
+                    int newCol = (landingCol + dist) & 0xFF;
                     int flatIndex = curRow * 256 + newCol;
 
                     byte plain = keyBytes[flatIndex];
@@ -2384,7 +2313,7 @@ namespace ZifikaLib
                     output.WriteByte(plain);
 
                     // advance cursor
-                    curCol = newCol;
+                    curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                     curRow = (curRow + 1) % blockSz;
                 }
 
@@ -2449,9 +2378,10 @@ namespace ZifikaLib
                     int rowJump = (jump >> 8) % keyBlockSize;
                     curRow = (curRow + rowJump) % keyBlockSize;
                     curCol = (curCol + colJump) & 0xFF;
+                    int landingCol = curCol;
 
                     // landing byte via verifier map
-                    int landingFlat = curRow * 256 + curCol;
+                    int landingFlat = curRow * 256 + landingCol;
                     byte landing = keyBytes[landingFlat];
 
                     int mixIdx = (int)(step & 31);
@@ -2463,7 +2393,7 @@ namespace ZifikaLib
 
                     int rowBase = curRow * 256;
                     int dist = rkdFlat[rowBase + (byte)cipherVal];
-                    int newCol = (curCol + dist) & 0xFF;
+                    int newCol = (landingCol + dist) & 0xFF;
                     // bind authority state to the distance encoding and resulting column
                     obsState[(mixIdx + 5) & 31] ^= (byte)dist;
                     obsState[(mixIdx + 7) & 31] ^= (byte)newCol;
@@ -2474,7 +2404,7 @@ namespace ZifikaLib
                     if (intCatLen > 0)
                         plain = (byte)((256 + plain - i - intCat[i % intCatLen]) % 256);
 
-                    curCol = newCol;
+                    curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                     curRow = (curRow + 1) % keyBlockSize;
 
                     output.WriteByte(plain);
@@ -2519,13 +2449,16 @@ namespace ZifikaLib
         /// </summary>
         /// <param name="mapped">Mapped ciphertext stream positioned at the first payload byte.<br/></param>
         /// <param name="startLocation">Start location for the walk (ushort domain).<br/></param>
-        /// <param name="verifyingKeyLock">Verifier lock bytes used for compact header XOR mode.<br/></param>
+        /// <param name="verifyingKeyLock">Verifier lock bytes used as the mint/verify v2 control catalyst.<br/></param>
         /// <param name="intCat">Interference catalyst for jump stream and plaintext mixing.<br/></param>
         /// <param name="count">Explicit byte count to read, or -1 to read to end.<br/></param>
-        /// <param name="rejectCompactHeader">Reject compact header marker when true.<br/></param>
+        /// <param name="rejectCompactHeader">Reserved for pre-release compatibility (unused in v2 header-only decoding).<br/></param>
         /// <param name="rkdFlat">Inverse rows for distance decoding (row-major).<br/></param>
-        internal ZifikaBufferStream UnmapDataWithRkd(ZifikaBufferStream mapped, short startLocation, ReadOnlySpan<byte> verifyingKeyLock, ReadOnlySpan<byte> intCat, int count, bool rejectCompactHeader, ReadOnlySpan<byte> rkdFlat)
+        /// <param name="keyBytes">Optional flat key bytes (row-major) used to resolve plaintext directly for reshuffled paths; leave empty to use verifier token lookups.<br/></param>
+        internal ZifikaBufferStream UnmapDataWithRkd(ZifikaBufferStream mapped, short startLocation, ReadOnlySpan<byte> verifyingKeyLock, ReadOnlySpan<byte> intCat, int count, bool rejectCompactHeader, ReadOnlySpan<byte> rkdFlat, ReadOnlySpan<byte> keyBytes = default)
         {
+            if (verifyingKeyLock.Length != Zifika.VerifyingKeyLockSize)
+                throw new ArgumentException($"verifyingKeyLock must be {Zifika.VerifyingKeyLockSize} bytes", nameof(verifyingKeyLock));
             int start = ((ushort)startLocation) % this.keyLength;
             int curRow = start / 256;
             int curCol = start % 256;
@@ -2536,6 +2469,7 @@ namespace ZifikaLib
             var bx = new JumpGenerator(keyHash.Span, 1, intCat);
             var noncesSpan = nonces.Span;
             var map = chMap;
+            bool useDirectKeyBytes = keyBytes.Length == keyLength;
             var streamLength = mapped.Length;
             var streamPos = mapped.Position;
 
@@ -2543,62 +2477,64 @@ namespace ZifikaLib
             if (count > 0)
             {
                 int marker = mapped.ReadByte();
-                if (marker >= 0)
+                if (marker < 0)
                 {
-                    const byte CompactMarker = 0xFE;
-                    if (marker == CompactMarker)
+                    Zifika.DebugMint("UnmapDataWithRkd(v2) header marker missing");
+                    return null;
+                }
+                if (marker == 0x01)
+                {
+                    int uniqueCount = mapped.ReadByte();
+                    if (uniqueCount < 0)
                     {
-                        if (rejectCompactHeader)
-                            return null;
-                        var buf = new byte[count];
-                        for (int i = 0; i < count; i++) buf[i] = (byte)mapped.ReadByte();
-                        var ks = new byte[count];
-                        using (var xof = new Blake3XofReader(keyHash.Span, verifyingKeyLock))
-                        {
-                            xof.ReadNext(ks);
-                        }
-                        var outBuf = new byte[count];
-                        for (int i = 0; i < count; i++) outBuf[i] = (byte)(buf[i] ^ ks[i]);
-                        return new ZifikaBufferStream(outBuf);
+                        Zifika.DebugMint("UnmapDataWithRkd(v2) uniqueCount missing");
+                        return null;
                     }
-                    if (marker == 0x01)
-                    {
-                        int uniqueCount = mapped.ReadByte();
-                        var unique = new ushort[uniqueCount];
-                        for (int u = 0; u < uniqueCount; u++)
-                            unique[u] = mapped.ReadUInt16();
+                    var unique = new ushort[uniqueCount];
+                    for (int u = 0; u < uniqueCount; u++)
+                        unique[u] = mapped.ReadUInt16();
 
-                        perPositionNonces = new ushort[count];
-                        for (int i = 0; i < count; i++)
+                    perPositionNonces = new ushort[count];
+                    for (int i = 0; i < count; i++)
+                    {
+                        int idx = mapped.ReadByte();
+                        if ((uint)idx >= (uint)uniqueCount)
                         {
-                            int idx = mapped.ReadByte();
-                            perPositionNonces[i] = unique[idx];
+                            Zifika.DebugMint($"UnmapDataWithRkd(v2) dict nonce index out of range: idx={idx} uniqueCount={uniqueCount}");
+                            return null;
+                        }
+                        perPositionNonces[i] = unique[idx];
+                    }
+                }
+                else if (marker == 0x00)
+                {
+                    perPositionNonces = new ushort[count];
+                    int p = 0;
+                    while (p < count)
+                    {
+                        int hdr = mapped.ReadByte();
+                        bool isRepeat = (hdr & 0x80) != 0;
+                        int len = hdr & 0x7F;
+                        if (len == 0)
+                        {
+                            Zifika.DebugMint("UnmapDataWithRkd(v2) RLE zero-length header");
+                            return null;
+                        }
+                        if (isRepeat)
+                        {
+                            ushort val = mapped.ReadUInt16();
+                            for (int k = 0; k < len; k++) perPositionNonces[p++] = val;
+                        }
+                        else
+                        {
+                            for (int k = 0; k < len; k++) perPositionNonces[p++] = mapped.ReadUInt16();
                         }
                     }
-                    else if (marker == 0x00)
-                    {
-                        perPositionNonces = new ushort[count];
-                        int p = 0;
-                        while (p < count)
-                        {
-                            int hdr = mapped.ReadByte();
-                            bool isRepeat = (hdr & 0x80) != 0;
-                            int len = hdr & 0x7F;
-                            if (isRepeat)
-                            {
-                                ushort val = mapped.ReadUInt16();
-                                for (int k = 0; k < len; k++) perPositionNonces[p++] = val;
-                            }
-                            else
-                            {
-                                for (int k = 0; k < len; k++) perPositionNonces[p++] = mapped.ReadUInt16();
-                            }
-                        }
-                    }
-                    else
-                    {
-                        mapped.Position -= 1;
-                    }
+                }
+                else
+                {
+                    Zifika.DebugMint($"UnmapDataWithRkd(v2) invalid header marker: 0x{marker:X2}");
+                    return null;
                 }
                 streamLength = mapped.Length;
                 streamPos = mapped.Position;
@@ -2616,22 +2552,34 @@ namespace ZifikaLib
 
                 curRow = (curRow + rowJ) % blockSz;
                 curCol = (curCol + colJ) & 0xFF;
+                int landingCol = curCol;
 
                 int rowBase = curRow * 256;
                 int dist = rkdFlat[rowBase + (byte)cipherVal];
-                int newCol = (curCol + dist) & 0xFF;
+                int newCol = (landingCol + dist) & 0xFF;
                 int flatIndex = curRow * 256 + newCol;
 
-                ushort r = perPositionNonces != null && i < perPositionNonces.Length ? perPositionNonces[i] : noncesSpan[flatIndex];
-                uint h32 = Zifika.ComputeH32(keyHash.Span, flatIndex, r);
-                if (!map.TryGetValue(h32, out byte plain))
-                    throw new CryptographicException($"verifier lookup failed at index {flatIndex}");
+                byte plain;
+                if (useDirectKeyBytes)
+                {
+                    plain = keyBytes[flatIndex];
+                }
+                else
+                {
+                    ushort r = perPositionNonces != null && i < perPositionNonces.Length ? perPositionNonces[i] : noncesSpan[flatIndex];
+                    uint h32 = Zifika.ComputeH32(keyHash.Span, flatIndex, r);
+                    if (!map.TryGetValue(h32, out plain))
+                    {
+                        Zifika.DebugMint($"UnmapDataWithRkd(v2) verifier lookup failed i={i} flat={flatIndex} row={curRow} col={newCol} dist={dist}");
+                        return null;
+                    }
+                }
 
                 if (intCatLen > 0)
                     plain = (byte)((256 + plain - i - intCat[i % intCatLen]) % 256);
 
                 output.WriteByte(plain);
-                curCol = newCol;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % blockSz;
             }
 
@@ -2690,8 +2638,9 @@ namespace ZifikaLib
                 int rowJump = (jump >> 8) % keyBlockSize;
                 curRow = (curRow + rowJump) % keyBlockSize;
                 curCol = (curCol + colJump) & 0xFF;
+                int landingCol = curCol;
 
-                int landingFlat = curRow * 256 + curCol;
+                int landingFlat = curRow * 256 + landingCol;
                 byte landing = keyBytes[landingFlat];
 
                 int mixIdx = (int)(step & 31);
@@ -2703,7 +2652,7 @@ namespace ZifikaLib
 
                 int rowBase = curRow * 256;
                 int dist = rkdFlat[rowBase + (byte)cipherVal];
-                int newCol = (curCol + dist) & 0xFF;
+                int newCol = (landingCol + dist) & 0xFF;
                 obsState[(mixIdx + 5) & 31] ^= (byte)dist;
                 obsState[(mixIdx + 7) & 31] ^= (byte)newCol;
 
@@ -2713,7 +2662,7 @@ namespace ZifikaLib
                 if (intCatLen > 0)
                     plain = (byte)((256 + plain - i - intCat[i % intCatLen]) % 256);
 
-                curCol = newCol;
+                curCol = (landingCol + ((dist << 1) & 0xFF)) & 0xFF;
                 curRow = (curRow + 1) % keyBlockSize;
 
                 output.WriteByte(plain);
